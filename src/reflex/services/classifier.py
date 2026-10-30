@@ -290,7 +290,13 @@ class ReflexClassifier:
             if not isinstance(suggested_tags, list):
                 suggested_tags = []
 
-            actionable = bool(data.get("actionable", False))
+            # `is True`, not bool(), for the same reason as is_command above:
+            # bool("false") is True, so a model SAYING not-actionable was
+            # stored as actionable, and bot.py's actionable-entries query
+            # surfaces it as a todo. Absent or any other value means not
+            # actionable, which is the direction that fails quiet rather than
+            # inventing work.
+            actionable = data.get("actionable") is True
 
             return ClassificationResult(
                 category=category,

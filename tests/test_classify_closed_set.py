@@ -68,6 +68,29 @@ class TestTheCategoryComesFromTheClosedSet:
             r._classify_single("msg", "m1")
 
 
+class TestActionableIsNotCoerced:
+    """`bool("false")` is True, so a model saying not-actionable was stored as
+    actionable, and bot.py's actionable-entries query surfaces it as a todo.
+
+    Same coercion the is_command guard exists to prevent, on the sibling field
+    in the same function.
+    """
+
+    @pytest.mark.parametrize("raw", ["false", "no", "0", 0, "", [], {"a": 1}, None])
+    def test_only_literal_true_is_actionable(self, raw):
+        r = _classifier(
+            {"category": "admin", "confidence": 0.9, "reasoning": "r", "actionable": raw}
+        )
+        assert r._classify_single("msg", "m1").actionable is False
+
+    def test_literal_true_still_is(self):
+        """The control: refusing everything would also pass the test above."""
+        r = _classifier(
+            {"category": "admin", "confidence": 0.9, "reasoning": "r", "actionable": True}
+        )
+        assert r._classify_single("msg", "m1").actionable is True
+
+
 class TestANonObjectResponseIsRefusedNotCrashed:
     """`null`, `5`, `[]` and `"x"` are valid JSON and have no fields.
 
@@ -230,8 +253,9 @@ class TestIntentValidationNeverInventsAConfidence:
 
     bot.py:477 runs `if is_command and confidence >= tier2_threshold`, and that
     threshold comes from REFLEX_LLM_TIER2_CONFIDENCE_THRESHOLD (default 0.6).
-    The old default of 0.5 was below it only by coincidence of two
-    independently configured values.
+    Any invented confidence is compared against a separately configured
+    threshold, so whether it clears the bar is a coincidence of two values
+    nothing keeps in step.
     """
 
     def test_a_missing_confidence_is_refused(self):
@@ -248,13 +272,13 @@ class TestIntentValidationNeverInventsAConfidence:
 
     @pytest.mark.parametrize("raw", ["false", "no", "0", "False", "off", {"a": 1}, [0]])
     def test_a_present_non_true_is_command_does_not_become_true(self, raw):
-        """bool("false") is True, so the model SAYING no meant yes.
+        """bool("false") is True, so the model SAYING no means yes.
 
-        The original comment here claimed this path failed closed. It did so
-        only for an ABSENT key: any present non-empty string is truthy, so
-        {"is_command": "false", "confidence": 0.95} cleared bot.py:477's
-        threshold and ran a command against an existing entry -- on a message
-        the model had just declined to treat as a command.
+        Failing closed on an ABSENT key is not the same as failing closed:
+        any present non-empty string is truthy, so
+        {"is_command": "false", "confidence": 0.95} clears bot.py's threshold
+        and runs a command against an existing entry -- on a message the model
+        had just declined to treat as a command.
         """
         c = _cascade({"is_command": raw, "confidence": 0.95})
         is_command, _ = c._validate_intent_single("remind me to archive this", "m1")
@@ -269,12 +293,9 @@ class TestIntentValidationNeverInventsAConfidence:
     def test_a_non_numeric_confidence_is_refused_not_turned_into_point_five(
         self, raw
     ):
-        """The case the first version of this class missed.
-
-        It guarded `"confidence" not in data` and left `except (ValueError,
-        TypeError): confidence = 0.5` four lines below -- same method, same
-        consequence, and `{"confidence": "high"}` is a likelier model output
-        than an absent key. Three reviewers found it independently.
+        """A PRESENT but non-numeric confidence, which is the likelier model
+        output: guarding only `"confidence" not in data` leaves
+        `{"confidence": "high"}` to reach a coercion that invents 0.5.
         """
         c = _cascade({"is_command": True, "confidence": raw})
         with pytest.raises(LLMError, match="confidence"):
@@ -295,9 +316,10 @@ class TestIntentValidationNeverInventsAConfidence:
 class TestTheIntentCascade:
     """validate_intent() is the structurally identical sibling of classify().
 
-    Mutation testing found it entirely unpinned: breaking the escalation and
-    moving the threshold boundary both left the suite green. _validate_intent_single
-    was tested directly, the public method never.
+    Testing `_validate_intent_single` directly leaves the PUBLIC method
+    unpinned: breaking the escalation, or moving the threshold boundary, is
+    invisible to a suite that only drives the helper. These tests go through
+    `validate_intent`.
     """
 
     def test_tier1_raising_escalates_to_tier2(self):
