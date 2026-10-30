@@ -70,9 +70,7 @@ class TestTheCategoryComesFromTheClosedSet:
 
 class TestActionableIsNotCoerced:
     """`bool("false")` is True, so a model saying not-actionable was stored as
-    actionable, and `storage/postgres.py`'s `get_digest_entries` shows it as a
-    todo -- when the model also picked `category='admin'`, which that query
-    requires too.
+    actionable.
 
     Same coercion the is_command guard exists to prevent, on the sibling field
     in the same function.
@@ -253,7 +251,7 @@ class TestTheCascade:
 class TestIntentValidationNeverInventsAConfidence:
     """A fabricated confidence can EXECUTE a command, not just file a capture.
 
-    bot.py:477 runs `if is_command and confidence >= tier2_threshold`, and that
+    bot.py runs `if is_command and confidence >= tier2_threshold`, and that
     threshold comes from REFLEX_LLM_TIER2_CONFIDENCE_THRESHOLD (default 0.6).
     Any invented confidence is compared against a separately configured
     threshold, so whether it clears the bar is a coincidence of two values
@@ -305,7 +303,7 @@ class TestIntentValidationNeverInventsAConfidence:
 
     @pytest.mark.parametrize("raw", [True, "inf", 42.0, -1.0])
     def test_an_out_of_range_intent_confidence_is_refused(self, raw):
-        """This value is the SOLE gate on executing a command (bot.py:477).
+        """This value is the SOLE gate on executing a command.
 
         There is no database CHECK behind the intent path the way there is
         behind a filed capture, so an out-of-range value here is unopposed.
@@ -346,7 +344,8 @@ class TestTheIntentCascade:
     def test_tier2_also_failing_propagates(self):
         """Both tiers refusing must raise, not return a fabricated pair.
 
-        A swallow here would hand bot.py:477 an (is_command, confidence) that
+        A swallow here would hand bot.py's command branch an
+        (is_command, confidence) that
         no model produced.
         """
         c = _cascade({"is_command": True}, {"is_command": True})

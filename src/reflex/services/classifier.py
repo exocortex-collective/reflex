@@ -143,8 +143,8 @@ class ReflexClassifier:
         """Parse a model-supplied confidence, or raise.
 
         No default and no clamp. Both invent a number, and this number gates
-        execution: bot.py:477 runs a command when confidence >= the tier-2
-        threshold, which is env-set (bot.py:239). float() alone is not a
+        execution: bot.py runs a command when confidence >= the tier-2
+        threshold, which is env-set. float() alone is not a
         guard -- float(True) is 1.0, bools do not raise, and "inf"/"1e9"
         parse fine, so an out-of-range value reads as total certainty. The
         range test also rejects nan, since every nan comparison is False.
@@ -292,12 +292,8 @@ class ReflexClassifier:
 
             # `is True`, not bool(), for the same reason as is_command above:
             # bool("false") is True, so a model SAYING not-actionable was
-            # stored as actionable. storage/postgres.py's get_digest_entries
-            # then shows it as a todo -- though only when the model also
-            # picked category='admin', which that query also requires.
-            # Absent or any other value means not actionable, the direction
-            # that fails quiet rather than inventing work; a demoted entry
-            # still appears in the FYI digest via get_digest_info_entries.
+            # stored as actionable. Absent or any other value means not
+            # actionable, the direction that fails quiet.
             actionable = data.get("actionable") is True
 
             return ClassificationResult(
