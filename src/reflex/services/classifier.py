@@ -50,11 +50,12 @@ Return JSON:
 """
 
 
-# THE CLOSED SET the model's output is validated against. docs/agent-isolation
-# requires this: "the model's output is validated against a closed set before
-# anything acts on it." It already existed as bot.py's VALID_CATEGORIES, where
-# it guarded the move-command parse and NOT this -- the classification that
-# decides where a capture is filed. Same list, now applied to both.
+# THE CLOSED SET the model's output is validated against, as cortex's agent
+# isolation rule requires (`CLAUDE.md` -> Agent Isolation, and
+# `docs/agent-isolation.md`). bot.py has the same list, where it guards the
+# move-command parse and NOT this -- the classification that decides where a
+# capture is filed. A closed set applied to the wrong output is the defect
+# this one is here to avoid; keep both in step.
 VALID_CATEGORIES = frozenset({"person", "project", "idea", "admin", "inbox"})
 
 
@@ -123,6 +124,21 @@ class ReflexClassifier:
         return is_command, confidence
 
     @staticmethod
+    def _object_or_raise(data: object, where: str) -> dict:
+        """json.loads returns whatever the model sent, which need not be an object.
+
+        `null`, `5`, `[]` and `"x"` are all valid JSON. Only an object has the
+        fields the guards below read, and reaching them with anything else
+        raises AttributeError (`data.get`) or TypeError (`"x" not in data`) --
+        neither of which is an LLMError, so classify()'s tier-1 handler does
+        not catch it, the cascade never reaches tier 2, and a raw exception
+        leaves the classifier.
+        """
+        if not isinstance(data, dict):
+            raise LLMError(f"{where} returned JSON {type(data).__name__}, not an object")
+        return data
+
+    @staticmethod
     def _confidence(data: dict, where: str) -> float:
         """Parse a model-supplied confidence, or raise.
 
@@ -169,7 +185,7 @@ class ReflexClassifier:
                 response_format={"type": "json_object"},
             )
             content = self.llm._get_content_from_response(result)
-            data = json.loads(content)
+            data = self._object_or_raise(json.loads(content), "intent validation")
 
             # `is True`, not bool(): bool("false") is True, so a model
             # SAYING not-a-command became is_command=True and, at a plausible
@@ -246,17 +262,16 @@ class ReflexClassifier:
                 response_format={"type": "json_object"},
             )
             content = self.llm._get_content_from_response(result_dict)
-            data = json.loads(content)
+            data = self._object_or_raise(json.loads(content), "classification")
 
-            # PRESENCE, then the closed set. A default turns "the model said
-            # nothing" into "the model said this", and nothing downstream can
-            # tell the difference: `category` defaulted to "inbox", a REAL
-            # category, so a response missing the field filed a capture
-            # instead of failing. An out-of-set category was already refused
-            # by the CHECK in migrations/001 -- so that half of this is
-            # defence in depth in front of the database, and it earns its
-            # place by naming the failure instead of raising IntegrityError.
-            # The missing-field half is the part the CHECK could not see.
+            # PRESENCE, then the closed set. A default would turn "the model
+            # said nothing" into "the model said this", and a default category
+            # is a REAL category, so the row stays valid and nothing
+            # downstream can tell the difference. The CHECK in migrations/001
+            # refuses an out-of-set category too, so that half is defence in
+            # depth that earns its place by naming the failure instead of
+            # raising IntegrityError; the missing-field half is the part the
+            # CHECK cannot see.
             if "category" not in data:
                 raise LLMError("classification has no 'category'; response is incomplete")
             category = data["category"]

@@ -1,21 +1,19 @@
 """The classification that files a capture must come from a closed set.
 
-`docs/agent-isolation.md` requires it: "the model's output is validated against
-a closed set before anything acts on it." The set already existed in this
-codebase -- bot.py's VALID_CATEGORIES -- where it guarded the move-command
-parse and NOT this path, the one that decides where a capture is filed.
+Cortex's agent isolation rule requires it (`CLAUDE.md` -> Agent Isolation, and
+`docs/agent-isolation.md`). bot.py carries the same list, where it guards the
+move-command parse and not this path -- so a closed set existing is not
+evidence that it guards the output that decides anything.
 
-Before: `category` defaulted to "inbox", a REAL category, so a response that
-OMITTED the field filed a capture instead of failing. An out-of-set category
-was already refused by the CHECK in migrations/001 -- so the set test here is
-defence in depth in front of the database, and it earns its place by naming
-the failure instead of raising IntegrityError. The omitted-field case is the
-part the CHECK could not see.
+An out-of-set `category` is refused by the CHECK in migrations/001 as well, so
+the set test here is defence in depth in front of the database, earning its
+place by naming the failure instead of raising IntegrityError. A MISSING
+`category` is the part the CHECK cannot see, because a default supplies a real
+category and the row is then valid.
 
-`confidence` defaulted to 0.5, which classify() compares against
-tier1_threshold (0.7) to decide whether to escalate, and which on the INTENT
-path gates executing a command -- a manufactured number reaching a live
-branch.
+`confidence` is the other invented value: classify() compares it against
+tier1_threshold to decide whether to escalate, and on the INTENT path it gates
+executing a command.
 """
 
 from __future__ import annotations
@@ -70,6 +68,29 @@ class TestTheCategoryComesFromTheClosedSet:
             r._classify_single("msg", "m1")
 
 
+class TestANonObjectResponseIsRefusedNotCrashed:
+    """`null`, `5`, `[]` and `"x"` are valid JSON and have no fields.
+
+    Reaching the field guards with one raises AttributeError (`data.get`) or
+    TypeError (`"x" not in data`). Neither is an LLMError, so classify()'s
+    tier-1 handler does not catch it, tier 2 is never tried, and the raw
+    exception leaves the classifier -- the one failure mode the cascade exists
+    to absorb.
+    """
+
+    @pytest.mark.parametrize("payload", [None, 5, [], "x", 1.5, True])
+    def test_classify_refuses_a_non_object(self, payload):
+        r = _classifier(payload)
+        with pytest.raises(LLMError, match="not an object"):
+            r._classify_single("msg", "m1")
+
+    @pytest.mark.parametrize("payload", [None, 5, [], "x", 1.5, True])
+    def test_intent_validation_refuses_a_non_object(self, payload):
+        c = _cascade(payload)
+        with pytest.raises(LLMError, match="not an object"):
+            c._validate_intent_single("move 3 to admin", "m1")
+
+
 class TestConfidenceIsNeverInvented:
     def test_a_missing_confidence_is_refused_rather_than_becoming_point_five(self):
         """0.5 is compared against tier1_threshold to decide escalation."""
@@ -81,6 +102,30 @@ class TestConfidenceIsNeverInvented:
         r = _classifier({"category": "admin", "confidence": "high", "reasoning": "r"})
         with pytest.raises(LLMError, match="confidence"):
             r._classify_single("msg", "m1")
+
+    @pytest.mark.parametrize("raw", [0.0, 1.0])
+    def test_the_range_bounds_are_inclusive(self, raw):
+        """Pins `<=` against `<`.
+
+        An exclusive-bounds mutant (`0.0 < value < 1.0`) survived the first
+        version of this suite: nothing asserted that a model may report total
+        certainty or none at all.
+        """
+        r = _classifier({"category": "admin", "confidence": raw, "reasoning": "r"})
+        assert r._classify_single("msg", "m1").confidence == raw
+
+    @pytest.mark.parametrize("raw", ["0.5", "1", "0"])
+    def test_a_numeric_string_confidence_is_accepted(self, raw):
+        """Pins `str` in the isinstance tuple, deliberately.
+
+        Dropping `str` from it also survived the first suite. Accepting a
+        numeric string matches cortex_utils's client, which coerces the same
+        way; the guard that matters is the range test below, which a string
+        cannot get past either. Tighten here only if the client tightens too,
+        or the two disagree about the same model output.
+        """
+        r = _classifier({"category": "admin", "confidence": raw, "reasoning": "r"})
+        assert r._classify_single("msg", "m1").confidence == float(raw)
 
     @pytest.mark.parametrize("raw", [True, False, "inf", "1e9", 42.0, -0.5, "nan"])
     def test_a_confidence_outside_zero_to_one_is_refused(self, raw):
@@ -288,11 +333,11 @@ class TestTheIntentCascade:
 def test_the_set_matches_the_database_check_that_actually_guards_the_path():
     """The load-bearing joint, and the one nothing pinned.
 
-    Eight copies of this set exist in reflex. The copy that guards the only
-    model-derived target -- category selects the export DIRECTORY -- is the
-    CHECK in migrations/001, not any Python list. A migration that relaxes it,
-    or a sixth category added to the frozenset but not the CHECK, opens that
-    path with a green suite.
+    This set is written out in several places across reflex. The copy that
+    guards the only model-derived target -- category selects the export
+    DIRECTORY -- is the CHECK in migrations/001, not any Python list. A
+    migration that relaxes it, or a sixth category added to the frozenset but
+    not the CHECK, opens that path with a green suite.
     """
     import pathlib
     import re
