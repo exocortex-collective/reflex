@@ -1,8 +1,6 @@
 """LLM classification service with two-tier cascade."""
 
 import json
-import os
-from typing import Optional
 
 from cortex_utils.llm import LLMClient, LLMError
 from cortex_utils.logging import get_logger
@@ -50,6 +48,15 @@ Return JSON:
   "confidence": 0.0-1.0
 }}
 """
+
+
+# THE CLOSED SET the model's output is validated against, as cortex's agent
+# isolation rule requires (`CLAUDE.md` -> Agent Isolation, and
+# `docs/agent-isolation.md`). bot.py has the same list, where it guards the
+# move-command parse and NOT this -- the classification that decides where a
+# capture is filed. A closed set applied to the wrong output is the defect
+# this one is here to avoid; keep both in step.
+VALID_CATEGORIES = frozenset({"person", "project", "idea", "admin", "inbox"})
 
 
 class ReflexClassifier:
@@ -107,13 +114,53 @@ class ReflexClassifier:
 
         # Escalate to Tier 2
         logger.info(
-            f"Intent validation tier 1 confidence {confidence:.2f} < {self.tier1_threshold}, escalating"
+            f"Intent validation tier 1 confidence {confidence:.2f} "
+            f"< {self.tier1_threshold}, escalating"
         )
         is_command, confidence = self._validate_intent_single(message, self.tier2_model)
         logger.info(
             f"Intent validation tier 2: is_command={is_command}, confidence={confidence}"
         )
         return is_command, confidence
+
+    @staticmethod
+    def _object_or_raise(data: object, where: str) -> dict:
+        """json.loads returns whatever the model sent, which need not be an object.
+
+        `null`, `5`, `[]` and `"x"` are all valid JSON. Only an object has the
+        fields the guards below read, and reaching them with anything else
+        raises AttributeError (`data.get`) or TypeError (`"x" not in data`) --
+        neither of which is an LLMError, so classify()'s tier-1 handler does
+        not catch it, the cascade never reaches tier 2, and a raw exception
+        leaves the classifier.
+        """
+        if not isinstance(data, dict):
+            raise LLMError(f"{where} returned JSON {type(data).__name__}, not an object")
+        return data
+
+    @staticmethod
+    def _confidence(data: dict, where: str) -> float:
+        """Parse a model-supplied confidence, or raise.
+
+        No default and no clamp. Both invent a number, and this number gates
+        execution: bot.py runs a command when confidence >= the tier-2
+        threshold, which is env-set. float() alone is not a
+        guard -- float(True) is 1.0, bools do not raise, and "inf"/"1e9"
+        parse fine, so an out-of-range value reads as total certainty. The
+        range test also rejects nan, since every nan comparison is False.
+        """
+        if "confidence" not in data:
+            raise LLMError(f"{where} has no 'confidence'; response is incomplete")
+        raw = data["confidence"]
+        if isinstance(raw, bool) or not isinstance(raw, (int, float, str)):
+            raise LLMError(f"{where} confidence is not a number: {raw!r}")
+        try:
+            value = float(raw)
+        except (ValueError, TypeError) as e:
+            raise LLMError(f"{where} confidence is not a number: {raw!r}") from e
+        if not 0.0 <= value <= 1.0:
+            raise LLMError(f"{where} confidence out of range [0,1]: {value!r}")
+        return value
 
     def _validate_intent_single(self, message: str, model: str) -> tuple[bool, float]:
         """Validate intent with a single model.
@@ -138,17 +185,17 @@ class ReflexClassifier:
                 response_format={"type": "json_object"},
             )
             content = self.llm._get_content_from_response(result)
-            data = json.loads(content)
+            data = self._object_or_raise(json.loads(content), "intent validation")
 
-            is_command = bool(data.get("is_command", False))
-            raw_confidence = data.get("confidence", 0.5)
-            try:
-                confidence = float(raw_confidence)
-            except (ValueError, TypeError):
-                logger.warning(f"Invalid confidence from intent validation: {raw_confidence}")
-                confidence = 0.5
-
-            return is_command, confidence
+            # `is True`, not bool(): bool("false") is True, so a model
+            # SAYING not-a-command became is_command=True and, at a plausible
+            # confidence, executed one. Only the literal JSON true counts;
+            # every other value -- absent, "false", 0, None, a dict -- means
+            # not a command, so this is the direction that fails closed.
+            is_command = data.get("is_command") is True
+            # This is the path that EXECUTES, so confidence gets no default
+            # and no fallback -- see _confidence.
+            return is_command, self._confidence(data, "intent validation")
 
         except json.JSONDecodeError as e:
             logger.error(f"Intent validation returned invalid JSON: {e}")
@@ -166,7 +213,7 @@ class ReflexClassifier:
         Raises:
             LLMError: If both tiers fail
         """
-        result: Optional[ClassificationResult] = None
+        result: ClassificationResult | None = None
         # Try Tier 1
         try:
             result = self._classify_single(message, self.tier1_model)
@@ -182,7 +229,8 @@ class ReflexClassifier:
         # Escalate to Tier 2
         if result:
             logger.info(
-                f"Classification tier 1 confidence {result.confidence:.2f} < {self.tier1_threshold}, escalating"
+                f"Classification tier 1 confidence {result.confidence:.2f} "
+                f"< {self.tier1_threshold}, escalating"
             )
         result = self._classify_single(message, self.tier2_model)
         logger.info(
@@ -214,23 +262,39 @@ class ReflexClassifier:
                 response_format={"type": "json_object"},
             )
             content = self.llm._get_content_from_response(result_dict)
-            data = json.loads(content)
+            data = self._object_or_raise(json.loads(content), "classification")
 
-            # Parse fields
-            category = data.get("category", "inbox")
-            raw_confidence = data.get("confidence", 0.5)
-            try:
-                confidence = float(raw_confidence)
-            except (ValueError, TypeError):
-                logger.warning(f"Invalid confidence: {raw_confidence}")
-                confidence = 0.5
+            # PRESENCE, then the closed set. A default would turn "the model
+            # said nothing" into "the model said this", and a default category
+            # is a REAL category, so the row stays valid and nothing
+            # downstream can tell the difference. The CHECK in migrations/001
+            # refuses an out-of-set category too, so that half is defence in
+            # depth that earns its place by naming the failure instead of
+            # raising IntegrityError; the missing-field half is the part the
+            # CHECK cannot see.
+            if "category" not in data:
+                raise LLMError("classification has no 'category'; response is incomplete")
+            category = data["category"]
+            # isinstance first: `["admin"] not in VALID_CATEGORIES` raises
+            # TypeError (unhashable), which no handler here catches, so the
+            # cascade is skipped and the operator sees a raw TypeError.
+            if not isinstance(category, str) or category not in VALID_CATEGORIES:
+                raise LLMError(
+                    f"model returned category {category!r}, which is not one of "
+                    f"{sorted(VALID_CATEGORIES)}"
+                )
+            confidence = self._confidence(data, "classification")
 
             reasoning = data.get("reasoning", "")
             suggested_tags = data.get("suggested_tags", [])
             if not isinstance(suggested_tags, list):
                 suggested_tags = []
 
-            actionable = bool(data.get("actionable", False))
+            # `is True`, not bool(), for the same reason as is_command above:
+            # bool("false") is True, so a model SAYING not-actionable was
+            # stored as actionable. Absent or any other value means not
+            # actionable, the direction that fails quiet.
+            actionable = data.get("actionable") is True
 
             return ClassificationResult(
                 category=category,

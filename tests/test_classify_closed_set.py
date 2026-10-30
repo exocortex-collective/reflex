@@ -1,0 +1,371 @@
+"""The classification that files a capture must come from a closed set.
+
+Cortex's agent isolation rule requires it (`CLAUDE.md` -> Agent Isolation, and
+`docs/agent-isolation.md`). bot.py carries the same list, where it guards the
+move-command parse and not this path -- so a closed set existing is not
+evidence that it guards the output that decides anything.
+
+An out-of-set `category` is refused by the CHECK in migrations/001 as well, so
+the set test here is defence in depth in front of the database, earning its
+place by naming the failure instead of raising IntegrityError. A MISSING
+`category` is the part the CHECK cannot see, because a default supplies a real
+category and the row is then valid.
+
+`confidence` is the other invented value: classify() compares it against
+tier1_threshold to decide whether to escalate, and on the INTENT path it gates
+executing a command.
+"""
+
+from __future__ import annotations
+
+import json
+from unittest import mock
+
+import httpx
+import pytest
+from cortex_utils.llm import LLMClient, LLMError
+
+from reflex.services.classifier import VALID_CATEGORIES, ReflexClassifier
+
+
+def _classifier(payload):
+    c = ReflexClassifier.__new__(ReflexClassifier)
+    c.tier1_model, c.tier2_model = "m1", "m2"
+    c.tier1_threshold, c.tier2_threshold = 0.7, 0.5
+    c.llm = LLMClient("http://llm.test")
+    c.llm.client = mock.Mock()
+    c.llm.client.post.return_value = httpx.Response(
+        200,
+        json={"choices": [{"message": {"content": json.dumps(payload)}, "finish_reason": "stop"}]},
+        request=httpx.Request("POST", "http://llm.test"),
+    )
+    return c
+
+
+class TestTheCategoryComesFromTheClosedSet:
+    def test_a_complete_valid_response_classifies(self):
+        """The control. Refusing everything would satisfy the tests below."""
+        r = _classifier({"category": "admin", "confidence": 0.9, "reasoning": "r"})
+        result = r._classify_single("msg", "m1")
+        assert result.category == "admin"
+        assert result.confidence == 0.9
+
+    @pytest.mark.parametrize("category", sorted(VALID_CATEGORIES))
+    def test_every_member_of_the_set_is_accepted(self, category):
+        r = _classifier({"category": category, "confidence": 0.8, "reasoning": "r"})
+        assert r._classify_single("msg", "m1").category == category
+
+    @pytest.mark.parametrize("category", ["urgent", "spam", "Inbox", "", "INBOX", "admin "])
+    def test_a_category_outside_the_set_is_refused(self, category):
+        """Includes near-misses: case and whitespace are not members."""
+        r = _classifier({"category": category, "confidence": 0.9, "reasoning": "r"})
+        with pytest.raises(LLMError, match="not one of"):
+            r._classify_single("msg", "m1")
+
+    def test_a_missing_category_is_refused_rather_than_becoming_inbox(self):
+        r = _classifier({"confidence": 0.9, "reasoning": "r"})
+        with pytest.raises(LLMError, match="category"):
+            r._classify_single("msg", "m1")
+
+
+class TestActionableIsNotCoerced:
+    """`bool("false")` is True, so a model saying not-actionable was stored as
+    actionable.
+
+    Same coercion the is_command guard exists to prevent, on the sibling field
+    in the same function.
+    """
+
+    @pytest.mark.parametrize("raw", ["false", "no", "0", 0, "", [], {"a": 1}, None])
+    def test_only_literal_true_is_actionable(self, raw):
+        r = _classifier(
+            {"category": "admin", "confidence": 0.9, "reasoning": "r", "actionable": raw}
+        )
+        assert r._classify_single("msg", "m1").actionable is False
+
+    def test_literal_true_still_is(self):
+        """The control: refusing everything would also pass the test above."""
+        r = _classifier(
+            {"category": "admin", "confidence": 0.9, "reasoning": "r", "actionable": True}
+        )
+        assert r._classify_single("msg", "m1").actionable is True
+
+
+class TestANonObjectResponseIsRefusedNotCrashed:
+    """`null`, `5`, `[]` and `"x"` are valid JSON and have no fields.
+
+    Reaching the field guards with one raises AttributeError (`data.get`) or
+    TypeError (`"x" not in data`). Neither is an LLMError, so classify()'s
+    tier-1 handler does not catch it, tier 2 is never tried, and the raw
+    exception leaves the classifier -- the one failure mode the cascade exists
+    to absorb.
+    """
+
+    @pytest.mark.parametrize("payload", [None, 5, [], "x", 1.5, True])
+    def test_classify_refuses_a_non_object(self, payload):
+        r = _classifier(payload)
+        with pytest.raises(LLMError, match="not an object"):
+            r._classify_single("msg", "m1")
+
+    @pytest.mark.parametrize("payload", [None, 5, [], "x", 1.5, True])
+    def test_intent_validation_refuses_a_non_object(self, payload):
+        c = _cascade(payload)
+        with pytest.raises(LLMError, match="not an object"):
+            c._validate_intent_single("move 3 to admin", "m1")
+
+
+class TestConfidenceIsNeverInvented:
+    def test_a_missing_confidence_is_refused_rather_than_becoming_point_five(self):
+        """0.5 is compared against tier1_threshold to decide escalation."""
+        r = _classifier({"category": "admin", "reasoning": "r"})
+        with pytest.raises(LLMError, match="confidence"):
+            r._classify_single("msg", "m1")
+
+    def test_a_non_numeric_confidence_is_refused(self):
+        r = _classifier({"category": "admin", "confidence": "high", "reasoning": "r"})
+        with pytest.raises(LLMError, match="confidence"):
+            r._classify_single("msg", "m1")
+
+    @pytest.mark.parametrize("raw", [0.0, 1.0])
+    def test_the_range_bounds_are_inclusive(self, raw):
+        """Pins `<=` against `<`.
+
+        An exclusive-bounds mutant (`0.0 < value < 1.0`) survived the first
+        version of this suite: nothing asserted that a model may report total
+        certainty or none at all.
+        """
+        r = _classifier({"category": "admin", "confidence": raw, "reasoning": "r"})
+        assert r._classify_single("msg", "m1").confidence == raw
+
+    @pytest.mark.parametrize("raw", ["0.5", "1", "0"])
+    def test_a_numeric_string_confidence_is_accepted(self, raw):
+        """Pins `str` in the isinstance tuple, deliberately.
+
+        Dropping `str` from it also survived the first suite. Accepting a
+        numeric string matches cortex_utils's client, which coerces the same
+        way; the guard that matters is the range test below, which a string
+        cannot get past either. Tighten here only if the client tightens too,
+        or the two disagree about the same model output.
+        """
+        r = _classifier({"category": "admin", "confidence": raw, "reasoning": "r"})
+        assert r._classify_single("msg", "m1").confidence == float(raw)
+
+    @pytest.mark.parametrize("raw", [True, False, "inf", "1e9", 42.0, -0.5, "nan"])
+    def test_a_confidence_outside_zero_to_one_is_refused(self, raw):
+        """float() is not a guard.
+
+        float(True) is 1.0 and bools do not raise, so a bool reads as total
+        certainty. "inf" and "1e9" parse fine. nan is refused because every
+        comparison against it is False, so `0.0 <= nan <= 1.0` fails.
+        """
+        r = _classifier({"category": "admin", "confidence": raw, "reasoning": "r"})
+        with pytest.raises(LLMError, match="confidence"):
+            r._classify_single("msg", "m1")
+
+    @pytest.mark.parametrize("category", [["admin"], {"admin": 1}, 3, None])
+    def test_a_non_string_category_is_refused_without_a_type_error(self, category):
+        """`["admin"] not in VALID_CATEGORIES` raises TypeError: unhashable.
+
+        No handler in _classify_single or classify() catches TypeError, so it
+        would skip the cascade and surface raw to the operator. The isinstance
+        test has to come first.
+        """
+        r = _classifier({"category": category, "confidence": 0.9, "reasoning": "r"})
+        with pytest.raises(LLMError, match="not one of"):
+            r._classify_single("msg", "m1")
+
+
+def test_the_set_matches_the_one_the_move_command_already_used():
+    """Two copies of a closed set that disagree is worse than one.
+
+    bot.py's VALID_CATEGORIES guards the move-command parse. If these drift, a
+    category the bot accepts by hand becomes one the classifier refuses.
+    """
+    from reflex.services.bot import ReflexBot
+
+    assert set(ReflexBot.VALID_CATEGORIES) == set(VALID_CATEGORIES)
+
+
+def _cascade(*payloads):
+    """A classifier whose successive LLM calls return `payloads` in order.
+
+    classify() is where this PR's behaviour change actually lives: tier 1
+    raising is now ROUTINE (any out-of-set category), so the catch-and-escalate
+    went from a rare path to a hot one, and tier 2 raising is a brand-new
+    terminal outcome. Neither was tested on this branch or on main.
+    """
+    c = ReflexClassifier("http://llm.test", "m1", "m2", 0.7, 0.6)
+    c.llm.client = mock.Mock()
+    c.llm.client.post.side_effect = [
+        httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": json.dumps(p)}, "finish_reason": "stop"}]},
+            request=httpx.Request("POST", "http://llm.test"),
+        )
+        for p in payloads
+    ]
+    return c
+
+
+class TestTheCascade:
+    def test_tier1_out_of_set_escalates_and_tier2_is_returned(self):
+        c = _cascade(
+            {"category": "urgent", "confidence": 0.9, "reasoning": "t1"},
+            {"category": "idea", "confidence": 0.9, "reasoning": "t2"},
+        )
+        assert c.classify("msg").category == "idea"
+        assert c.llm.client.post.call_count == 2
+
+    def test_tier2_also_failing_propagates_rather_than_filing(self):
+        """The one that matters.
+
+        A mutant wrapping the tier-2 call so an LLMError returns
+        category="inbox", confidence=0.5 passed all 17 tests -- this PR's exact
+        defect reinstated one level up. Raising drops the capture and shows the
+        user a visible failure, which is the right direction under
+        docs/agent-isolation.md: nothing is filed on a fabricated category.
+        """
+        c = _cascade(
+            {"category": "urgent", "confidence": 0.9, "reasoning": "t1"},
+            {"category": "alsobad", "confidence": 0.9, "reasoning": "t2"},
+        )
+        with pytest.raises(LLMError):
+            c.classify("msg")
+
+    def test_tier1_below_threshold_escalates(self):
+        """0.5 < 0.7, so tier 1's answer is not returned even though it is valid."""
+        c = _cascade(
+            {"category": "admin", "confidence": 0.5, "reasoning": "t1"},
+            {"category": "idea", "confidence": 0.95, "reasoning": "t2"},
+        )
+        assert c.classify("msg").category == "idea"
+        assert c.llm.client.post.call_count == 2
+
+    def test_tier1_at_or_above_threshold_short_circuits(self):
+        """The control: escalating always would also pass the tests above."""
+        c = _cascade({"category": "admin", "confidence": 0.7, "reasoning": "t1"})
+        assert c.classify("msg").category == "admin"
+        assert c.llm.client.post.call_count == 1, "tier 2 must not be called"
+
+
+class TestIntentValidationNeverInventsAConfidence:
+    """A fabricated confidence can EXECUTE a command, not just file a capture.
+
+    bot.py runs `if is_command and confidence >= tier2_threshold`, and that
+    threshold comes from REFLEX_LLM_TIER2_CONFIDENCE_THRESHOLD (default 0.6).
+    Any invented confidence is compared against a separately configured
+    threshold, so whether it clears the bar is a coincidence of two values
+    nothing keeps in step.
+    """
+
+    def test_a_missing_confidence_is_refused(self):
+        c = _cascade({"is_command": True})
+        with pytest.raises(LLMError, match="confidence"):
+            c._validate_intent_single("move 3 to admin", "m1")
+
+    def test_is_command_still_defaults_closed(self):
+        """Absent is_command means 'not a command', which is the safe default."""
+        c = _cascade({"confidence": 0.95})
+        is_command, confidence = c._validate_intent_single("hello", "m1")
+        assert is_command is False
+        assert confidence == 0.95
+
+    @pytest.mark.parametrize("raw", ["false", "no", "0", "False", "off", {"a": 1}, [0]])
+    def test_a_present_non_true_is_command_does_not_become_true(self, raw):
+        """bool("false") is True, so the model SAYING no means yes.
+
+        Failing closed on an ABSENT key is not the same as failing closed:
+        any present non-empty string is truthy, so
+        {"is_command": "false", "confidence": 0.95} clears bot.py's threshold
+        and runs a command against an existing entry -- on a message the model
+        had just declined to treat as a command.
+        """
+        c = _cascade({"is_command": raw, "confidence": 0.95})
+        is_command, _ = c._validate_intent_single("remind me to archive this", "m1")
+        assert is_command is False
+
+    def test_a_literal_true_is_still_honoured(self):
+        """The control: failing closed must not mean never recognising a command."""
+        c = _cascade({"is_command": True, "confidence": 0.95})
+        assert c._validate_intent_single("archive 3", "m1") == (True, 0.95)
+
+    @pytest.mark.parametrize("raw", ["high", "very high", None, {}, []])
+    def test_a_non_numeric_confidence_is_refused_not_turned_into_point_five(
+        self, raw
+    ):
+        """A PRESENT but non-numeric confidence, which is the likelier model
+        output: guarding only `"confidence" not in data` leaves
+        `{"confidence": "high"}` to reach a coercion that invents 0.5.
+        """
+        c = _cascade({"is_command": True, "confidence": raw})
+        with pytest.raises(LLMError, match="confidence"):
+            c._validate_intent_single("archive that", "m1")
+
+    @pytest.mark.parametrize("raw", [True, "inf", 42.0, -1.0])
+    def test_an_out_of_range_intent_confidence_is_refused(self, raw):
+        """This value is the SOLE gate on executing a command.
+
+        There is no database CHECK behind the intent path the way there is
+        behind a filed capture, so an out-of-range value here is unopposed.
+        """
+        c = _cascade({"is_command": True, "confidence": raw})
+        with pytest.raises(LLMError, match="confidence"):
+            c._validate_intent_single("archive that", "m1")
+
+
+class TestTheIntentCascade:
+    """validate_intent() is the structurally identical sibling of classify().
+
+    Testing `_validate_intent_single` directly leaves the PUBLIC method
+    unpinned: breaking the escalation, or moving the threshold boundary, is
+    invisible to a suite that only drives the helper. These tests go through
+    `validate_intent`.
+    """
+
+    def test_tier1_raising_escalates_to_tier2(self):
+        c = _cascade({"is_command": True}, {"is_command": True, "confidence": 0.9})
+        assert c.validate_intent("archive that") == (True, 0.9)
+        assert c.llm.client.post.call_count == 2
+
+    def test_tier1_below_threshold_escalates(self):
+        c = _cascade(
+            {"is_command": True, "confidence": 0.5},
+            {"is_command": True, "confidence": 0.95},
+        )
+        assert c.validate_intent("archive that") == (True, 0.95)
+        assert c.llm.client.post.call_count == 2
+
+    def test_tier1_at_the_threshold_short_circuits(self):
+        """The boundary. 0.7 >= 0.7, so tier 2 must not be called."""
+        c = _cascade({"is_command": True, "confidence": 0.7})
+        assert c.validate_intent("archive that") == (True, 0.7)
+        assert c.llm.client.post.call_count == 1, "tier 2 must not be called"
+
+    def test_tier2_also_failing_propagates(self):
+        """Both tiers refusing must raise, not return a fabricated pair.
+
+        A swallow here would hand bot.py's command branch an
+        (is_command, confidence) that
+        no model produced.
+        """
+        c = _cascade({"is_command": True}, {"is_command": True})
+        with pytest.raises(LLMError, match="confidence"):
+            c.validate_intent("archive that")
+
+
+def test_the_set_matches_the_database_check_that_actually_guards_the_path():
+    """The load-bearing joint, and the one nothing pinned.
+
+    This set is written out in several places across reflex. The copy that
+    guards the only model-derived target -- category selects the export
+    DIRECTORY -- is the CHECK in migrations/001, not any Python list. A
+    migration that relaxes it, or a sixth category added to the frozenset but
+    not the CHECK, opens that path with a green suite.
+    """
+    import pathlib
+    import re
+
+    sql = pathlib.Path("migrations/001_create_reflex_entries.sql").read_text()
+    m = re.search(r"category TEXT NOT NULL CHECK \(category IN \(([^)]*)\)\)", sql)
+    assert m, "the CHECK constraint on category is gone -- that IS the finding"
+    assert {v.strip().strip("'") for v in m.group(1).split(",")} == set(VALID_CATEGORIES)
