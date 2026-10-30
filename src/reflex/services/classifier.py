@@ -292,10 +292,12 @@ class ReflexClassifier:
 
             # `is True`, not bool(), for the same reason as is_command above:
             # bool("false") is True, so a model SAYING not-actionable was
-            # stored as actionable, and bot.py's actionable-entries query
-            # surfaces it as a todo. Absent or any other value means not
-            # actionable, which is the direction that fails quiet rather than
-            # inventing work.
+            # stored as actionable. storage/postgres.py's get_digest_entries
+            # then shows it as a todo -- though only when the model also
+            # picked category='admin', which that query also requires.
+            # Absent or any other value means not actionable, the direction
+            # that fails quiet rather than inventing work; a demoted entry
+            # still appears in the FYI digest via get_digest_info_entries.
             actionable = data.get("actionable") is True
 
             return ClassificationResult(

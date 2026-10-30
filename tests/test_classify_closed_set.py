@@ -70,7 +70,9 @@ class TestTheCategoryComesFromTheClosedSet:
 
 class TestActionableIsNotCoerced:
     """`bool("false")` is True, so a model saying not-actionable was stored as
-    actionable, and bot.py's actionable-entries query surfaces it as a todo.
+    actionable, and `storage/postgres.py`'s `get_digest_entries` shows it as a
+    todo -- when the model also picked `category='admin'`, which that query
+    requires too.
 
     Same coercion the is_command guard exists to prevent, on the sibling field
     in the same function.
