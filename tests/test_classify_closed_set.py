@@ -71,6 +71,7 @@ class TestTheCategoryComesFromTheClosedSet:
             ("**admin**", "admin"),
             ("`Idea`", "idea"),
             (" _Person_\n", "person"),
+            ("** admin **", "admin"),
         ],
     )
     def test_formatting_is_canonicalised_to_the_member(self, raw, category):
