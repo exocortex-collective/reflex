@@ -56,23 +56,18 @@ def test_the_parser_is_built_with_the_tier_1_model(built):
     assert model != "cloud/tier-2"
 
 
-def _passed(call) -> list:
-    """Every value a call received, positional or keyword.
-
-    Both call sites pass the key BY KEYWORD, so an args-only assertion would
-    have read as "the key was not passed" the moment the signature grew.
-    """
-    return list(call.args) + list(call.kwargs.values())
-
-
 def test_the_parser_gets_the_proxy_key(built):
+    """By KEYWORD, and the keyword is pinned. api_key is the 6th parameter of
+    ReflexClassifier, so a positional call would bind to the wrong thing the
+    next time either signature grows.
+    """
     _, parser = built
-    assert "sk-secret" in _passed(parser.call_args)
+    assert parser.call_args.kwargs["api_key"] == "sk-secret"
 
 
 def test_the_classifier_gets_the_proxy_key(built):
     classifier, _ = built
-    assert "sk-secret" in _passed(classifier.call_args)
+    assert classifier.call_args.kwargs["api_key"] == "sk-secret"
 
 
 def test_the_classifier_really_sends_the_header():
@@ -124,3 +119,162 @@ def test_the_classifier_still_gets_both_tiers(built):
     classifier, _ = built
     assert classifier.call_args.args[1] == "local-tier-1"
     assert classifier.call_args.args[2] == "cloud/tier-2"
+
+
+@pytest.mark.parametrize("key", [None, ""])
+def test_the_bot_builds_without_a_key(key):
+    """The direct-ollama configuration. LITELLM_API_KEY is optional, so
+    construction must not require it -- `os.environ[...]` here would break
+    every deployment that reaches a model directly.
+    """
+    env = dict(ENV)
+    if key is None:
+        del env["LITELLM_API_KEY"]
+    else:
+        env["LITELLM_API_KEY"] = key
+
+    with mock.patch.dict(os.environ, env, clear=True):
+        with (
+            mock.patch("reflex.services.bot.psycopg2.connect"),
+            mock.patch("reflex.services.bot.PostgresStorage"),
+            mock.patch("reflex.services.bot.MarkdownExporter"),
+            mock.patch("reflex.services.bot.ReflexClassifier"),
+            mock.patch("reflex.services.bot.CommandParser") as parser,
+            mock.patch("reflex.services.bot.AsyncIOScheduler"),
+        ):
+            ReflexBot()
+    assert parser.call_args.kwargs["api_key"] == key
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\n"])
+def test_a_blank_key_sends_no_header(blank):
+    """Documented as blank-is-absent, so it is asserted. A whitespace key
+    would otherwise send a bare "Bearer " and earn a 401 that looks like a
+    wrong credential rather than a missing one.
+    """
+    from reflex.services.classifier import ReflexClassifier
+    from reflex.services.commands import CommandParser
+
+    c = ReflexClassifier("http://proxy.test", "t1", "t2", api_key=blank)
+    assert "Authorization" not in c.llm.client.headers
+
+    p = CommandParser("http://proxy.test", "t1", api_key=blank)
+    try:
+        assert "Authorization" not in p.http_client.headers
+    finally:
+        p.close()
+
+
+def _parser_returning(content: str):
+    """A real CommandParser whose HTTP layer returns `content` as the model's
+    reply, so parse() is driven end to end rather than stubbed.
+    """
+    import httpx
+
+    from reflex.services.commands import CommandParser
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": content}}]}
+        )
+
+    p = CommandParser("http://proxy.test", "t1")
+    p.http_client.close()
+    p.http_client = httpx.Client(transport=httpx.MockTransport(handler))
+    return p
+
+
+def test_a_bare_string_of_keywords_is_dropped_not_iterated():
+    """resolve_target ITERATES target_keywords. A bare string iterates
+    character by character, so "idea" becomes four one-letter keywords and
+    "i" matches almost any title -- an archive or move landing on the wrong
+    entry. Same shape as the set.update("urgent") bug clean_tags prevents.
+    """
+    p = _parser_returning(
+        '{"action": "archive", "target": "that", "target_keywords": "idea"}'
+    )
+    try:
+        parsed = p.parse("archive that idea")
+    finally:
+        p.http_client.close()
+    assert parsed is not None
+    assert parsed.target_keywords == []
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        '{"action": "launch", "target": "that"}',
+        '{"action": ["move"], "target": "that"}',
+        '{"action": "move", "target": ["that"]}',
+    ],
+)
+def test_an_action_outside_the_closed_set_or_a_bad_target_is_refused(body):
+    p = _parser_returning(body)
+    try:
+        assert p.parse("do something") is None
+    finally:
+        p.http_client.close()
+
+
+def test_non_string_keywords_are_filtered_out():
+    """A list is not enough: resolve_target compares each keyword to a title,
+    so a number or a blank among them is junk to drop, not a reason to drop
+    the usable ones.
+    """
+    p = _parser_returning(
+        '{"action": "archive", "target": "that", '
+        '"target_keywords": ["idea", 5, "   ", "openforge"]}'
+    )
+    try:
+        parsed = p.parse("archive that idea")
+    finally:
+        p.http_client.close()
+    assert parsed is not None
+    assert parsed.target_keywords == ["idea", "openforge"]
+
+
+def test_the_parser_asks_for_json():
+    """A local model is likelier than a cloud one to answer with prose or a
+    fence. The fence-stripping in parse() stays either way; this is what
+    keeps it from being the common path.
+    """
+    import httpx
+
+    from reflex.services.commands import CommandParser
+
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json as _json
+
+        seen.update(_json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"content": '{"action": "show", "target": "that"}'}}
+                ]
+            },
+        )
+
+    p = CommandParser("http://proxy.test", "t1")
+    p.http_client.close()
+    p.http_client = httpx.Client(transport=httpx.MockTransport(handler))
+    try:
+        p.parse("show that")
+    finally:
+        p.http_client.close()
+    assert seen["response_format"] == {"type": "json_object"}
+
+
+def test_non_object_parameters_are_dropped():
+    p = _parser_returning(
+        '{"action": "tag", "target": "that", "parameters": ["urgent"]}'
+    )
+    try:
+        parsed = p.parse("tag that urgent")
+    finally:
+        p.http_client.close()
+    assert parsed is not None
+    assert parsed.parameters == {}

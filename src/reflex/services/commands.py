@@ -10,6 +10,15 @@ from cortex_utils.logging import get_logger
 logger = get_logger(__name__)
 
 
+# THE CLOSED SET the parser's `action` is validated against. ParsedCommand
+# types it as a Literal, which mypy checks and the model does not read: the
+# value arrives from json.loads, so the Literal is a promise to the reader,
+# not a guard. bot.py's execute_command falls through to "Unknown action" on
+# anything else, so an unknown action is already harmless -- this refuses it
+# where the other field checks are, rather than four call-frames later.
+VALID_ACTIONS = frozenset({"move", "tag", "archive", "show"})
+
+
 @dataclass
 class ParsedCommand:
     """Structured representation of a parsed command."""
@@ -63,12 +72,11 @@ Return ONLY valid JSON, no other text."""
 
         Args:
             litellm_url: LiteLLM proxy URL
-            model: Model to use for parsing. The bot passes the TIER 1 model,
-                which is local -- see bot.py for why the tier 2 model must not
-                be used here.
-            api_key: Sent as "Authorization: Bearer <key>". The proxy answers
-                401 without one (measured 2026-11-07). Blank or whitespace-only
-                is treated as absent, matching cortex_utils' LLMClient.
+            model: Model to use for parsing. The bot passes the tier-1
+                model; see bot.py.
+            api_key: Sent as "Authorization: Bearer <key>". Optional: a
+                proxy needs one, a directly reached ollama endpoint does not.
+                Blank or whitespace-only is treated as absent.
         """
         self.litellm_url = litellm_url.rstrip("/")
         self.model = model
@@ -100,6 +108,10 @@ Return ONLY valid JSON, no other text."""
                         }
                     ],
                     "temperature": 0.0,  # Deterministic parsing
+                    # As the classifier's calls do. The fence-stripping below
+                    # stays: this reduces how often it is needed, it does not
+                    # guarantee the model obeys.
+                    "response_format": {"type": "json_object"},
                 },
             )
             response.raise_for_status()
@@ -135,12 +147,48 @@ Return ONLY valid JSON, no other text."""
                 logger.error(f"Missing required fields in parsed command: {parsed}")
                 return None
 
+            # THE TYPES, not just the presence. Every value here came from
+            # json.loads, so each one is whatever the model emitted.
+            #
+            # target_keywords is the dangerous one: resolve_target iterates
+            # it, and a bare string iterates CHARACTER BY CHARACTER, so
+            # "idea" becomes four single-letter keywords and "i" matches
+            # almost any title -- an archive or move landing on the wrong
+            # entry. Same shape as the set.update("urgent") bug clean_tags
+            # exists to prevent, one field over.
+            if parsed["action"] not in VALID_ACTIONS:
+                logger.error(
+                    f"model returned action {parsed['action']!r}, which is not one of "
+                    f"{sorted(VALID_ACTIONS)}"
+                )
+                return None
+            if not isinstance(parsed["target"], str):
+                logger.error(f"parsed target is not a string: {parsed['target']!r}")
+                return None
+
+            raw_keywords = parsed.get("target_keywords", [])
+            if not isinstance(raw_keywords, list):
+                logger.warning(
+                    f"target_keywords is {type(raw_keywords).__name__}, not a list; "
+                    "dropping them"
+                )
+                raw_keywords = []
+            keywords = [k for k in raw_keywords if isinstance(k, str) and k.strip()]
+
+            parameters = parsed.get("parameters", {})
+            if not isinstance(parameters, dict):
+                logger.warning(
+                    f"parameters is {type(parameters).__name__}, not an object; "
+                    "dropping them"
+                )
+                parameters = {}
+
             # Build ParsedCommand
             return ParsedCommand(
                 action=parsed["action"],
                 target=parsed["target"],
-                target_keywords=parsed.get("target_keywords", []),
-                parameters=parsed.get("parameters", {}),
+                target_keywords=keywords,
+                parameters=parameters,
             )
 
         except httpx.HTTPStatusError as e:

@@ -224,10 +224,8 @@ class ReflexBot(commands.Bot):
         if not tier2_model:
             raise ValueError("REFLEX_LLM_TIER2_MODEL environment variable not set")
 
-        # OPTIONAL, deliberately. The proxy requires a key and answers 401
-        # without one (measured 2026-11-07), but an ollama endpoint reached
-        # directly requires none -- so demanding this would break the
-        # direct configuration rather than protect the proxy one.
+        # Optional: required for a proxy, meaningless for a directly
+        # reached ollama endpoint.
         litellm_api_key = os.getenv("LITELLM_API_KEY")
 
         # Parse thresholds with error handling
@@ -260,13 +258,12 @@ class ReflexBot(commands.Bot):
             api_key=litellm_api_key,
         )
 
-        # TIER 1, THE LOCAL MODEL, NOT TIER 2 -- and that is a privacy
-        # boundary, not a quality preference. Tier 2 is a cloud model, so
-        # building the parser with it sent every message that merely LOOKS
-        # like a command off the estate, with no local attempt first. Command
-        # text is capture text: it is whatever Devon typed. Ruled by Devon
-        # 2026-11-07. Tier 2 remains the escalation for CLASSIFICATION, where
-        # a low-confidence tier-1 answer earns the second opinion.
+        # Tier 1 deliberately: tier 2 is a cloud model, and this parses text
+        # the user typed.
+        #
+        # It does NOT make the command path local. validate_intent runs first
+        # and still escalates the same text to tier 2 on low confidence, so
+        # command-shaped text can still leave the estate.
         self.command_parser = CommandParser(
             litellm_url, tier1_model, api_key=litellm_api_key
         )
