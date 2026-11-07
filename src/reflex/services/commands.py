@@ -2,7 +2,7 @@
 
 import json
 from dataclasses import dataclass
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Optional, cast, get_args
 
 import httpx
 from cortex_utils.logging import get_logger
@@ -10,20 +10,21 @@ from cortex_utils.logging import get_logger
 logger = get_logger(__name__)
 
 
-# THE CLOSED SET the parser's `action` is validated against. ParsedCommand
-# types it as a Literal, which mypy checks and the model does not read: the
-# value arrives from json.loads, so the Literal is a promise to the reader,
-# not a guard. bot.py's execute_command falls through to "Unknown action" on
-# anything else, so an unknown action is already harmless -- this refuses it
-# where the other field checks are, rather than four call-frames later.
-VALID_ACTIONS = frozenset({"move", "tag", "archive", "show"})
+CommandAction = Literal["move", "tag", "archive", "show"]
+
+# DERIVED from the Literal, not written out beside it, so the closed set the
+# model is checked against and the type the rest of the code trusts cannot
+# drift apart. mypy checks the Literal; the model has never heard of it, and
+# the value arrives from json.loads -- so the frozenset is the real guard and
+# this keeps the two in step by construction.
+VALID_ACTIONS: frozenset[str] = frozenset(get_args(CommandAction))
 
 
 @dataclass
 class ParsedCommand:
     """Structured representation of a parsed command."""
 
-    action: Literal["move", "tag", "archive", "show"]
+    action: CommandAction
     target: str  # that, this, the last, recent
     target_keywords: list[str]  # Keywords to help resolve target
     parameters: dict[str, Any]  # Action-specific parameters
@@ -147,15 +148,13 @@ Return ONLY valid JSON, no other text."""
                 logger.error(f"Missing required fields in parsed command: {parsed}")
                 return None
 
-            # THE TYPES, not just the presence. Every value here came from
-            # json.loads, so each one is whatever the model emitted.
-            #
-            # target_keywords is the dangerous one: resolve_target iterates
-            # it, and a bare string iterates CHARACTER BY CHARACTER, so
-            # "idea" becomes four single-letter keywords and "i" matches
-            # almost any title -- an archive or move landing on the wrong
-            # entry. Same shape as the set.update("urgent") bug clean_tags
-            # exists to prevent, one field over.
+            # The TYPES, not just the presence: every value here came from
+            # json.loads. target_keywords is the one that matters, because
+            # resolve_target ITERATES it -- a bare string iterates character
+            # by character, so "i" matches almost any title.
+            if not isinstance(parsed["action"], str):
+                logger.error(f"parsed action is not a string: {parsed['action']!r}")
+                return None
             if parsed["action"] not in VALID_ACTIONS:
                 logger.error(
                     f"model returned action {parsed['action']!r}, which is not one of "
@@ -185,7 +184,8 @@ Return ONLY valid JSON, no other text."""
 
             # Build ParsedCommand
             return ParsedCommand(
-                action=parsed["action"],
+                # The membership check above is the proof mypy cannot see.
+                action=cast(CommandAction, parsed["action"]),
                 target=parsed["target"],
                 target_keywords=keywords,
                 parameters=parameters,

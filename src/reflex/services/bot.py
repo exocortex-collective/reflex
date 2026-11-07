@@ -150,7 +150,16 @@ class ReflexBot(commands.Bot):
         """Initialize bot."""
         intents = discord.Intents.default()
         intents.message_content = True  # Required to read messages
-        super().__init__(command_prefix="!", intents=intents)
+        # NO MENTIONS FROM ANY REPLY. execute_move echoes a rejected
+        # new_category back to Discord verbatim -- the rejection path is
+        # exactly where an arbitrary model-supplied value arrives -- and
+        # several other replies interpolate model output. Set on the client so
+        # it covers every send, not the two that happen to be known.
+        super().__init__(
+            command_prefix="!",
+            intents=intents,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
 
         # Configuration from environment
         self.reflex_channel_id = os.getenv("DISCORD_REFLEX_CHANNEL_ID")

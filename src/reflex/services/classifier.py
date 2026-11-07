@@ -2,6 +2,7 @@
 
 import json
 
+import httpx
 from cortex_utils.llm import LLMClient, LLMError
 from cortex_utils.logging import get_logger
 
@@ -132,7 +133,11 @@ class ReflexClassifier:
                     f"Intent validation tier 1: is_command={is_command}, confidence={confidence}"
                 )
                 return is_command, confidence
-        except LLMError as e:
+        # httpx.RequestError TOO, not just LLMError. _post_completion lets a
+        # transport failure through unwrapped -- the six public methods of
+        # LLMClient convert it, and reflex does not use them -- so a proxy
+        # that is down would otherwise skip tier 2 entirely.
+        except (LLMError, httpx.RequestError) as e:
             logger.warning(f"Tier 1 intent validation failed: {e}, trying tier 2")
 
         # Escalate to Tier 2
@@ -245,7 +250,8 @@ class ReflexClassifier:
                     f"Classification tier 1: {result.category} (confidence={result.confidence})"
                 )
                 return result
-        except LLMError as e:
+        # httpx.RequestError TOO; see validate_intent.
+        except (LLMError, httpx.RequestError) as e:
             logger.warning(f"Tier 1 classification failed: {e}, trying tier 2")
             # Continue to tier 2
 

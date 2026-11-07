@@ -1,12 +1,12 @@
-"""The command parser must be built with the TIER 1 model, not tier 2.
+"""The command parser must be built with the tier-1 model, not tier 2.
 
-Tier 2 is a cloud model. Building the parser with it sent every message that
-merely LOOKED like a command off the estate, with no local attempt first --
-and command text is capture text, whatever Devon typed. Ruled by Devon
-2026-11-07. Tier 2 remains the escalation for CLASSIFICATION only.
+Tier 2 is a cloud model, and the parser handles text the user typed. Devon's
+decision, relayed via exocortex-pm 2026-11-07.
 
-Asserted on the wiring rather than on a comment, because a comment cannot
-fail.
+It does NOT make the command path local: validate_intent runs first and still
+escalates to tier 2 on low confidence, which Devon allowed (reflex-3379).
+
+Asserted on the wiring, because a comment cannot fail.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from unittest import mock
 import pytest
 
 from reflex.services.bot import ReflexBot
+from reflex.services.commands import VALID_ACTIONS
 
 ENV = {
     "DISCORD_REFLEX_CHANNEL_ID": "1",
@@ -281,14 +282,10 @@ def test_non_object_parameters_are_dropped():
 
 
 def test_an_http_fault_in_tier_1_escalates_to_tier_2():
-    """THE POINT OF THE WHOLE CHAIN, asserted end to end.
+    """An HTTP fault in tier 1 must escalate, not escape.
 
-    A 401 or a 404 from the proxy used to leave cortex_utils as
-    httpx.HTTPStatusError, which is not an LLMError -- so `classify`'s tier-1
-    handler did not catch it, tier 2 was never tried, and a raw exception left
-    the classifier (utils-3258, fixed in cortex-utils 0dcd1e5). This pins the
-    behaviour from reflex's side, so a future pin bump that reintroduced it
-    would fail here rather than in production.
+    The cascade depends on cortex_utils raising an LLMError for a non-2xx; a
+    pin bump that reintroduced a raw httpx exception fails here.
     """
     import httpx
 
@@ -329,3 +326,149 @@ def test_an_http_fault_in_tier_1_escalates_to_tier_2():
     assert seen == ["tier1", "tier2"], "tier 1 must be tried, then escalated"
     assert result.category == "idea"
     assert result.model == "t2", "the tier-2 model answered"
+
+
+def test_the_closed_set_holds_exactly_the_four_actions():
+    """Written out, NOT derived. The acceptance test below parametrizes over
+    VALID_ACTIONS, so dropping a member drops its own test case with it and
+    the mutant survives -- a set under test cannot also be the test's source
+    of truth. execute_command's if/elif chain is the other half of this
+    contract, so a member added here needs a branch there.
+    """
+    assert VALID_ACTIONS == {"move", "tag", "archive", "show"}
+
+
+@pytest.mark.parametrize("action", sorted(VALID_ACTIONS))
+def test_every_action_in_the_closed_set_is_accepted(action):
+    """Dropping a member from VALID_ACTIONS used to survive: only "archive"
+    and "tag" were ever asserted as accepted, so "move" and "show" could have
+    been removed unnoticed. Parametrized over the set itself, so a member
+    added later is covered without touching this test.
+    """
+    p = _parser_returning('{"action": "%s", "target": "that"}' % action)
+    try:
+        parsed = p.parse("do the thing")
+    finally:
+        p.http_client.close()
+    assert parsed is not None
+    assert parsed.action == action
+
+
+def test_a_non_string_action_is_refused_by_the_type_check():
+    """`["move"] not in frozenset` raises TypeError (unhashable), which the
+    broad except turns into None -- so the refusal happened for the wrong
+    reason and the membership check never fired. An isinstance check now
+    precedes it, and this asserts the message rather than just the None.
+    """
+    from reflex.services import commands
+
+    p = _parser_returning('{"action": ["move"], "target": "that"}')
+    with mock.patch.object(commands.logger, "error") as logged:
+        try:
+            assert p.parse("move that") is None
+        finally:
+            p.http_client.close()
+    assert any("not a string" in str(c) for c in logged.call_args_list), (
+        logged.call_args_list
+    )
+
+
+def test_the_bot_sends_no_mentions():
+    """execute_move echoes a REJECTED new_category back to Discord verbatim,
+    and the rejection path is exactly where an arbitrary model-supplied value
+    arrives. Set on the client, so it covers every reply rather than the two
+    that are known today.
+    """
+    with mock.patch.dict(os.environ, ENV, clear=True):
+        with (
+            mock.patch("reflex.services.bot.psycopg2.connect"),
+            mock.patch("reflex.services.bot.PostgresStorage"),
+            mock.patch("reflex.services.bot.MarkdownExporter"),
+            mock.patch("reflex.services.bot.ReflexClassifier"),
+            mock.patch("reflex.services.bot.CommandParser"),
+            mock.patch("reflex.services.bot.AsyncIOScheduler"),
+        ):
+            bot = ReflexBot()
+    # Field by field: AllowedMentions has no __eq__, so comparing instances
+    # passes for ANY pair -- including a permissive one against none().
+    m = bot.allowed_mentions
+    assert (m.everyone, m.users, m.roles, m.replied_user) == (False, False, False, False)
+
+
+def test_a_transport_failure_in_tier_1_also_escalates():
+    """_post_completion lets httpx.RequestError through unwrapped -- the six
+    public methods of LLMClient convert it, and reflex does not use them. So
+    a proxy that is DOWN, as opposed to answering 401, would skip tier 2.
+    """
+    import httpx
+
+    from reflex.services.classifier import ReflexClassifier
+
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if '"t1"' in request.content.decode():
+            seen.append("tier1")
+            raise httpx.ConnectError("proxy is down")
+        seen.append("tier2")
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"category": "idea", "confidence": 0.9,'
+                            ' "reasoning": "r", "suggested_tags": [],'
+                            ' "actionable": false}'
+                        }
+                    }
+                ]
+            },
+        )
+
+    c = ReflexClassifier("http://proxy.test", "t1", "t2", api_key="k")
+    original = c.llm.client
+    c.llm.client = httpx.Client(transport=httpx.MockTransport(handler))
+    try:
+        result = c.classify("an idea")
+    finally:
+        c.llm.client.close()
+        original.close()
+    assert seen == ["tier1", "tier2"]
+    assert result.model == "t2"
+
+
+def test_a_transport_failure_in_intent_validation_also_escalates():
+    """validate_intent's cascade is a separate handler from classify's, and
+    only classify was pinned.
+    """
+    import httpx
+
+    from reflex.services.classifier import ReflexClassifier
+
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if '"t1"' in request.content.decode():
+            seen.append("tier1")
+            raise httpx.ConnectError("proxy is down")
+        seen.append("tier2")
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"content": '{"is_command": true, "confidence": 0.9}'}}
+                ]
+            },
+        )
+
+    c = ReflexClassifier("http://proxy.test", "t1", "t2", api_key="k")
+    original = c.llm.client
+    c.llm.client = httpx.Client(transport=httpx.MockTransport(handler))
+    try:
+        is_command, confidence = c.validate_intent("move that idea")
+    finally:
+        c.llm.client.close()
+        original.close()
+    assert seen == ["tier1", "tier2"]
+    assert is_command is True
