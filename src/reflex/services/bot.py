@@ -20,11 +20,7 @@ from prometheus_client import Counter, Histogram
 
 from reflex.migrations import BOT_VERSION, migrate_entry
 from reflex.models.entry import Entry
-from reflex.services.classifier import (
-    MAX_SUGGESTED_TAGS,
-    ReflexClassifier,
-    clean_tags,
-)
+from reflex.services.classifier import ReflexClassifier, clean_tags
 from reflex.services.commands import CommandParser, ParsedCommand
 from reflex.storage.exporter import MarkdownExporter
 from reflex.storage.postgres import PostgresStorage
@@ -655,13 +651,17 @@ class ReflexBot(commands.Bot):
             await message.reply("❌ No usable tags in tag command.")
             return
 
-        # Add new tags (avoid duplicates). sorted(), not list(): a set's order
-        # varies with PYTHONHASHSEED, and these tags are written into a
-        # git-committed vault file, so an arbitrary order means a spurious diff
-        # on every re-export.
+        # sorted(), not list(): a set's order varies with PYTHONHASHSEED, and
+        # these tags are written into a git-committed vault file, so an
+        # arbitrary order means a spurious diff on every re-export.
+        #
+        # NOT capped. clean_tags already caps the INCOMING batch; capping the
+        # TOTAL here truncated alphabetically and so deleted EXISTING tags --
+        # 15 existing z* plus 15 new a* lost ten of the user's own. Nothing
+        # the user already has is dropped.
         existing_tags = set(entry.tags or [])
         existing_tags.update(new_tags)
-        entry.tags = sorted(existing_tags)[:MAX_SUGGESTED_TAGS]
+        entry.tags = sorted(existing_tags)
 
         # Update in database
         await asyncio.to_thread(self.storage.update_entry, entry)
