@@ -15,7 +15,7 @@ dependencies = [
     "packaging>=23.0",
     "aiohttp>=3.9.0",
     "python-dateutil>=2.8.2",
-    "cortex-utils @ git+https://github.com/devonjones/cortex-utils.git@3c8a9d4",
+    "cortex-utils @ git+https://github.com/devonjones/cortex-utils.git@4c6fb5b",
 ]
 
 [project.optional-dependencies]

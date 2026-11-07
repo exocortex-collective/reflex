@@ -252,7 +252,12 @@ class ReflexBot(commands.Bot):
             tier2_threshold = 0.6
 
         self.classifier = ReflexClassifier(
-            litellm_url, tier1_model, tier2_model, tier1_threshold, tier2_threshold
+            litellm_url,
+            tier1_model,
+            tier2_model,
+            tier1_threshold,
+            tier2_threshold,
+            api_key=litellm_api_key,
         )
 
         # TIER 1, THE LOCAL MODEL, NOT TIER 2 -- and that is a privacy
@@ -262,7 +267,9 @@ class ReflexBot(commands.Bot):
         # text is capture text: it is whatever Devon typed. Ruled by Devon
         # 2026-11-07. Tier 2 remains the escalation for CLASSIFICATION, where
         # a low-confidence tier-1 answer earns the second opinion.
-        self.command_parser = CommandParser(litellm_url, tier1_model, litellm_api_key)
+        self.command_parser = CommandParser(
+            litellm_url, tier1_model, api_key=litellm_api_key
+        )
 
         # Initialize scheduler for digest
         self.scheduler = AsyncIOScheduler(timezone=timezone.utc)

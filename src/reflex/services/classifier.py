@@ -90,6 +90,7 @@ class ReflexClassifier:
         tier2_model: str,
         tier1_threshold: float = 0.7,
         tier2_threshold: float = 0.6,
+        api_key: str | None = None,
     ):
         """Initialize classifier with LiteLLM client.
 
@@ -99,8 +100,10 @@ class ReflexClassifier:
             tier2_model: Model for tier 2 (e.g., gemini/gemini-1.5-flash)
             tier1_threshold: Confidence threshold for tier 1 (default 0.7)
             tier2_threshold: Confidence threshold for tier 2 (default 0.6)
+            api_key: Bearer token for the proxy. Optional: a directly reached
+                ollama endpoint needs none.
         """
-        self.llm = LLMClient(litellm_base_url)
+        self.llm = LLMClient(litellm_base_url, api_key)
         self.tier1_model = tier1_model
         self.tier2_model = tier2_model
         self.tier1_threshold = tier1_threshold
