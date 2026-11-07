@@ -278,3 +278,54 @@ def test_non_object_parameters_are_dropped():
         p.http_client.close()
     assert parsed is not None
     assert parsed.parameters == {}
+
+
+def test_an_http_fault_in_tier_1_escalates_to_tier_2():
+    """THE POINT OF THE WHOLE CHAIN, asserted end to end.
+
+    A 401 or a 404 from the proxy used to leave cortex_utils as
+    httpx.HTTPStatusError, which is not an LLMError -- so `classify`'s tier-1
+    handler did not catch it, tier 2 was never tried, and a raw exception left
+    the classifier (utils-3258, fixed in cortex-utils 0dcd1e5). This pins the
+    behaviour from reflex's side, so a future pin bump that reintroduced it
+    would fail here rather than in production.
+    """
+    import httpx
+
+    from reflex.services.classifier import ReflexClassifier
+
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = request.content.decode()
+        if '"t1"' in body:
+            seen.append("tier1")
+            return httpx.Response(401, json={"detail": "no key"})
+        seen.append("tier2")
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"category": "idea", "confidence": 0.9,'
+                            ' "reasoning": "r", "suggested_tags": [],'
+                            ' "actionable": false}'
+                        }
+                    }
+                ]
+            },
+        )
+
+    c = ReflexClassifier("http://proxy.test", "t1", "t2", api_key="k")
+    original = c.llm.client
+    c.llm.client = httpx.Client(transport=httpx.MockTransport(handler))
+    try:
+        result = c.classify("an idea about something")
+    finally:
+        c.llm.client.close()
+        original.close()
+
+    assert seen == ["tier1", "tier2"], "tier 1 must be tried, then escalated"
+    assert result.category == "idea"
+    assert result.model == "t2", "the tier-2 model answered"

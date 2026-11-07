@@ -372,7 +372,7 @@ wheels = [
 [[package]]
 name = "cortex-utils"
 version = "0.1.0"
-source = { git = "https://github.com/devonjones/cortex-utils.git?rev=4c6fb5b#4c6fb5bc6626e1efbf2b4a8c59efc398ab6def97" }
+source = { git = "https://github.com/devonjones/cortex-utils.git?rev=0dcd1e5#0dcd1e563dde83e1cab8e9bfa71ef4dd60253955" }
 dependencies = [
     { name = "click" },
     { name = "docker" },
@@ -1432,7 +1432,7 @@ requires-dist = [
     { name = "aiohttp", specifier = ">=3.9.0" },
     { name = "apscheduler", specifier = ">=3.10.4" },
     { name = "black", marker = "extra == 'dev'", specifier = ">=23.11.0" },
-    { name = "cortex-utils", git = "https://github.com/devonjones/cortex-utils.git?rev=4c6fb5b" },
+    { name = "cortex-utils", git = "https://github.com/devonjones/cortex-utils.git?rev=0dcd1e5" },
     { name = "discord-py", specifier = ">=2.3.0" },
     { name = "gitpython", specifier = ">=3.1.40" },
     { name = "httpx", specifier = ">=0.27.0" },
