@@ -20,7 +20,11 @@ from prometheus_client import Counter, Histogram
 
 from reflex.migrations import BOT_VERSION, migrate_entry
 from reflex.models.entry import Entry
-from reflex.services.classifier import ReflexClassifier
+from reflex.services.classifier import (
+    MAX_SUGGESTED_TAGS,
+    ReflexClassifier,
+    clean_tags,
+)
 from reflex.services.commands import CommandParser, ParsedCommand
 from reflex.storage.exporter import MarkdownExporter
 from reflex.storage.postgres import PostgresStorage
@@ -643,15 +647,21 @@ class ReflexBot(commands.Bot):
             entry: Target entry
             parsed: ParsedCommand
         """
-        new_tags = parsed.parameters.get("tags", [])
+        # The move command above validates its parameter against a closed set
+        # and this one did not, so `set.update("urgent")` added six
+        # single-character tags. clean_tags refuses a non-list outright.
+        new_tags = clean_tags(parsed.parameters.get("tags", []))
         if not new_tags:
-            await message.reply("❌ No tags specified in tag command.")
+            await message.reply("❌ No usable tags in tag command.")
             return
 
-        # Add new tags (avoid duplicates)
+        # Add new tags (avoid duplicates). sorted(), not list(): a set's order
+        # varies with PYTHONHASHSEED, and these tags are written into a
+        # git-committed vault file, so an arbitrary order means a spurious diff
+        # on every re-export.
         existing_tags = set(entry.tags or [])
         existing_tags.update(new_tags)
-        entry.tags = list(existing_tags)
+        entry.tags = sorted(existing_tags)[:MAX_SUGGESTED_TAGS]
 
         # Update in database
         await asyncio.to_thread(self.storage.update_entry, entry)
