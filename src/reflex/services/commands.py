@@ -58,16 +58,25 @@ Examples:
 
 Return ONLY valid JSON, no other text."""
 
-    def __init__(self, litellm_url: str, model: str):
+    def __init__(self, litellm_url: str, model: str, api_key: Optional[str] = None):
         """Initialize command parser.
 
         Args:
             litellm_url: LiteLLM proxy URL
-            model: Model to use for parsing (e.g., gemini/gemini-1.5-flash)
+            model: Model to use for parsing. The bot passes the TIER 1 model,
+                which is local -- see bot.py for why the tier 2 model must not
+                be used here.
+            api_key: Sent as "Authorization: Bearer <key>". The proxy answers
+                401 without one (measured 2026-11-07). Blank or whitespace-only
+                is treated as absent, matching cortex_utils' LLMClient.
         """
         self.litellm_url = litellm_url.rstrip("/")
         self.model = model
-        self.http_client = httpx.Client(timeout=30.0)
+        key = (api_key or "").strip()
+        self.http_client = httpx.Client(
+            timeout=30.0,
+            headers={"Authorization": f"Bearer {key}"} if key else {},
+        )
 
     def parse(self, command: str) -> Optional[ParsedCommand]:
         """Parse natural language command into structured form.
