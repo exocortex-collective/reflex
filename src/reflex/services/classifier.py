@@ -275,6 +275,11 @@ class ReflexClassifier:
             if "category" not in data:
                 raise LLMError("classification has no 'category'; response is incomplete")
             category = data["category"]
+            if isinstance(category, str):
+                # Formatting is not a different answer: "Admin", " admin" and
+                # "**admin**" are admin (Devon, cortex-6e0h). The value is only
+                # reformatted, never mapped to a different member.
+                category = category.strip().strip("*_`").strip().lower()
             # isinstance first: `["admin"] not in VALID_CATEGORIES` raises
             # TypeError (unhashable), which no handler here catches, so the
             # cascade is skipped and the operator sees a raw TypeError.

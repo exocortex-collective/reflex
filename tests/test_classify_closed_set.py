@@ -55,12 +55,29 @@ class TestTheCategoryComesFromTheClosedSet:
         r = _classifier({"category": category, "confidence": 0.8, "reasoning": "r"})
         assert r._classify_single("msg", "m1").category == category
 
-    @pytest.mark.parametrize("category", ["urgent", "spam", "Inbox", "", "INBOX", "admin "])
+    @pytest.mark.parametrize("category", ["urgent", "spam", "", "**", "in box", "admins"])
     def test_a_category_outside_the_set_is_refused(self, category):
-        """Includes near-misses: case and whitespace are not members."""
+        """Includes near-misses that canonicalising must not rescue."""
         r = _classifier({"category": category, "confidence": 0.9, "reasoning": "r"})
         with pytest.raises(LLMError, match="not one of"):
             r._classify_single("msg", "m1")
+
+    @pytest.mark.parametrize(
+        ("raw", "category"),
+        [
+            ("Inbox", "inbox"),
+            ("INBOX", "inbox"),
+            ("admin ", "admin"),
+            ("**admin**", "admin"),
+            ("`Idea`", "idea"),
+            (" _Person_\n", "person"),
+        ],
+    )
+    def test_formatting_is_canonicalised_to_the_member(self, raw, category):
+        """Devon, cortex-6e0h: case, whitespace and markdown emphasis are not a
+        different answer, so they no longer escalate to tier 2."""
+        r = _classifier({"category": raw, "confidence": 0.9, "reasoning": "r"})
+        assert r._classify_single("msg", "m1").category == category
 
     def test_a_missing_category_is_refused_rather_than_becoming_inbox(self):
         r = _classifier({"confidence": 0.9, "reasoning": "r"})
