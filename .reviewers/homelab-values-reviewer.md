@@ -28,7 +28,7 @@ Enforce CLAUDE.md's **no hardcoded homelab values** and **no hardcoded LLM model
 - **Docs / CLAUDE.md** that reference the real infra intentionally.
 - **Prompt text held outside code** — an env var, or a file loaded at startup the way cortex-school keeps `bin/prompts/*`. That is the *correct* place for it.
 - Note reflex has **no** rules-config database and no `rules.yaml`, so the triage-style "it belongs in the YAML" exemption does not apply here.
-- The module-constant prompts already in `services/classifier.py` are tracked by **reflex-2f5b**. Run `bd show reflex-2f5b` before flagging them: while it is open they are known debt, and if it is closed while they remain, that is a finding. Flag any NEW hardcoded prompt regardless, and never cite those two as precedent.
+- The module-constant prompts already in `services/classifier.py` are tracked by **reflex-2f5b**. Check it before flagging them: while it is open they are known debt, and if it is closed while they remain, that is a finding. `bd` does not walk up out of a sub-repo, so run it from the parent cortex checkout that owns `.beads`, not from this repo — from here it exits with `no beads database found`. If `bd` is unreachable, treat the ticket as open and say in your report that the check was not run. Flag any NEW hardcoded prompt regardless, and never cite those two as precedent.
 - Env reads with **no** homelab default (`os.environ["OLLAMA_URL"]` or `os.getenv("OLLAMA_URL")` returning None) — those are compliant.
 
 ---
