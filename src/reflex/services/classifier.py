@@ -58,6 +58,10 @@ Return JSON:
 # this one is here to avoid; keep both in step.
 VALID_CATEGORIES = frozenset({"person", "project", "idea", "admin", "inbox"})
 
+# A model returning hundreds of tags should not fill the frontmatter or the
+# Discord reply. The number is arbitrary; the cap is the point.
+MAX_SUGGESTED_TAGS = 20
+
 
 class ReflexClassifier:
     """Two-tier LLM classifier for Reflex captures."""
@@ -101,9 +105,7 @@ class ReflexClassifier:
         confidence: float = 0.0
         # Try Tier 1
         try:
-            is_command, confidence = self._validate_intent_single(
-                message, self.tier1_model
-            )
+            is_command, confidence = self._validate_intent_single(message, self.tier1_model)
             if confidence >= self.tier1_threshold:
                 logger.info(
                     f"Intent validation tier 1: is_command={is_command}, confidence={confidence}"
@@ -118,9 +120,7 @@ class ReflexClassifier:
             f"< {self.tier1_threshold}, escalating"
         )
         is_command, confidence = self._validate_intent_single(message, self.tier2_model)
-        logger.info(
-            f"Intent validation tier 2: is_command={is_command}, confidence={confidence}"
-        )
+        logger.info(f"Intent validation tier 2: is_command={is_command}, confidence={confidence}")
         return is_command, confidence
 
     @staticmethod
@@ -233,9 +233,7 @@ class ReflexClassifier:
                 f"< {self.tier1_threshold}, escalating"
             )
         result = self._classify_single(message, self.tier2_model)
-        logger.info(
-            f"Classification tier 2: {result.category} (confidence={result.confidence})"
-        )
+        logger.info(f"Classification tier 2: {result.category} (confidence={result.confidence})")
         return result
 
     def _classify_single(self, message: str, model: str) -> ClassificationResult:
@@ -291,9 +289,18 @@ class ReflexClassifier:
             confidence = self._confidence(data, "classification")
 
             reasoning = data.get("reasoning", "")
-            suggested_tags = data.get("suggested_tags", [])
-            if not isinstance(suggested_tags, list):
-                suggested_tags = []
+            # The list check alone left ELEMENTS unvalidated, and a
+            # non-string one raised TypeError in two separate `', '.join`
+            # calls -- the markdown export (silently, in a daemon thread) and
+            # the Discord reply. Drop anything that is not a usable string and
+            # cap the count, so a model returning 500 tags or [{"a": 1}]
+            # cannot reach either sink.
+            raw_tags = data.get("suggested_tags", [])
+            if not isinstance(raw_tags, list):
+                raw_tags = []
+            suggested_tags = [t for t in raw_tags if isinstance(t, str) and t.strip()][
+                :MAX_SUGGESTED_TAGS
+            ]
 
             # `is True`, not bool(), for the same reason as is_command above:
             # bool("false") is True, so a model SAYING not-actionable was
