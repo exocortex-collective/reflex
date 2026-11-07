@@ -30,6 +30,12 @@ def _bot():
     # taken, so deleting the export call survived every test -- and the tags
     # reaching the vault is the whole reason their order matters.
     b.exporter = mock.Mock()
+    # Snapshot the tags AS WRITTEN. `assert_called_once_with(entry)` compares
+    # the same mutated object to itself, so it cannot see what the entry held
+    # at call time -- moving the assignment to AFTER the write persists the
+    # OLD tags and survived every test. The snapshot is what catches that.
+    b.persisted = []
+    b.storage.update_entry.side_effect = lambda e: b.persisted.append(list(e.tags))
     return b
 
 
@@ -81,6 +87,8 @@ async def test_a_list_of_tags_is_added_and_persisted():
     assert "Added tags" in reply
     bot.storage.update_entry.assert_called_once_with(entry)
     bot.exporter.export_entry.assert_called_once_with(entry)
+    # What reached the database, not what the object holds now.
+    assert bot.persisted == [["followup", "keep", "urgent"]]
 
 
 async def test_a_bare_string_is_refused_not_split_into_characters():
