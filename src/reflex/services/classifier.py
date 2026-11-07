@@ -105,7 +105,9 @@ class ReflexClassifier:
         confidence: float = 0.0
         # Try Tier 1
         try:
-            is_command, confidence = self._validate_intent_single(message, self.tier1_model)
+            is_command, confidence = self._validate_intent_single(
+                message, self.tier1_model
+            )
             if confidence >= self.tier1_threshold:
                 logger.info(
                     f"Intent validation tier 1: is_command={is_command}, confidence={confidence}"
@@ -120,7 +122,9 @@ class ReflexClassifier:
             f"< {self.tier1_threshold}, escalating"
         )
         is_command, confidence = self._validate_intent_single(message, self.tier2_model)
-        logger.info(f"Intent validation tier 2: is_command={is_command}, confidence={confidence}")
+        logger.info(
+            f"Intent validation tier 2: is_command={is_command}, confidence={confidence}"
+        )
         return is_command, confidence
 
     @staticmethod
@@ -233,7 +237,9 @@ class ReflexClassifier:
                 f"< {self.tier1_threshold}, escalating"
             )
         result = self._classify_single(message, self.tier2_model)
-        logger.info(f"Classification tier 2: {result.category} (confidence={result.confidence})")
+        logger.info(
+            f"Classification tier 2: {result.category} (confidence={result.confidence})"
+        )
         return result
 
     def _classify_single(self, message: str, model: str) -> ClassificationResult:
@@ -314,6 +320,21 @@ class ReflexClassifier:
                     f"{len(raw_tags)} suggested_tags (non-string, blank, or "
                     f"over the cap of {MAX_SUGGESTED_TAGS})"
                 )
+
+            # `is True`, not bool(), for the same reason as is_command above:
+            # bool("false") is True, so a model SAYING not-actionable was
+            # stored as actionable. Absent or any other value means not
+            # actionable, the direction that fails quiet.
+            actionable = data.get("actionable") is True
+
+            return ClassificationResult(
+                category=category,
+                confidence=confidence,
+                reasoning=reasoning,
+                suggested_tags=suggested_tags,
+                model=model,
+                actionable=actionable,
+            )
 
             # `is True`, not bool(), for the same reason as is_command above:
             # bool("false") is True, so a model SAYING not-actionable was
