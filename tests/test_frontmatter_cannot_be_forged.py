@@ -5,20 +5,8 @@ and it is git-committed and pushed to a remote. `docs/agent-isolation.md` item
 4 is the rule: the deciding question is not whether the input is trusted --
 almost none of it is -- but what the model's output CAUSES.
 
-The frontmatter used to be hand-built with an f-string, rendering tags as
-`tags: [{', '.join(entry.tags)}]`. Two failures came out of that one line:
-
-  * a tag containing `]` and a newline closed the list and added its own keys,
-    so the model could forge `category` and `status` past the closed set that
-    classifier.py enforces;
-  * a non-string tag made `', '.join` raise TypeError inside the daemon thread
-    in `_export_and_commit_sync`, whose `except Exception` logs and swallows --
-    so the database row existed, no markdown was ever written, and the user saw
-    a tick. Silent loss from a one-line model response.
-
-Serialising with `yaml.safe_dump` closes both for EVERY field at once, which
-is why these tests assert on the parsed frontmatter rather than on the text:
-the property is "no value can add a key", not "this string is absent".
+These tests assert on the PARSED frontmatter, because the property is "no
+value can add a key" and not "this string is absent".
 """
 
 from __future__ import annotations
@@ -51,8 +39,8 @@ EXPECTED_KEYS = {
 def _entry(tags: list) -> Entry:
     return Entry(
         id=1,
-        # An INT, so the str() coercion in the exporter is pinned: with a
-        # str here the coercion is a no-op and its removal survived.
+        # An INT, so the exporter's str() coercion is pinned: with a str
+        # here the coercion is a no-op and removing it survived.
         discord_message_id=1460394971273363629,  # type: ignore[arg-type]
         discord_channel_id="1460394971273363629",
         discord_user_id="509879976879718411",
@@ -136,13 +124,10 @@ def test_the_rendered_text_keeps_the_previous_file_shape():
 
 
 def test_a_dropped_tag_count_is_logged(monkeypatch):
-    """A silent drop is what made the original bug invisible.
-
-    The module's logger is replaced rather than captured. caplog does not see
-    structlog output, and capsys does but only when no other test has
-    reconfigured logging -- I tried both, and each passed in one arrangement
-    and failed in the other. Who the code CALLS is the behaviour worth
-    pinning, and it does not depend on global logging state.
+    """Patches the module logger rather than capturing output: caplog does
+    not see structlog, and capsys only works when no other test has
+    reconfigured logging. Who the code CALLS does not depend on global
+    logging state.
     """
     from reflex.services import classifier as mod
 
@@ -162,8 +147,8 @@ def test_a_non_list_tags_value_is_logged(monkeypatch):
 
 
 def test_a_non_ascii_tag_survives_unescaped():
-    """Pins allow_unicode=True: without it safe_dump escapes non-ASCII to
-    \\uXXXX, which is valid YAML but unreadable in the vault."""
+    """Pins allow_unicode=True: without it safe_dump escapes non-ASCII,
+    which is valid YAML but unreadable in the vault."""
     fm = _frontmatter(["café", "日本語"])
     assert fm["tags"] == ["café", "日本語"]
     md = MarkdownExporter._generate_markdown(None, _entry(["café"]))  # type: ignore[arg-type]

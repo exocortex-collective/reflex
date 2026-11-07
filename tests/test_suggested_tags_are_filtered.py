@@ -1,20 +1,12 @@
-"""A model's `suggested_tags` reach two `', '.join` calls and the database.
+"""A model's `suggested_tags` reach several `', '.join` calls and the database.
 
-classifier.py checked `isinstance(suggested_tags, list)` and left the ELEMENTS
-unvalidated. A non-string element raised TypeError in the markdown export
-(silently, inside a daemon thread whose `except Exception` swallows) and in the
-Discord reply at bot.py, and the junk was stored either way.
+`yaml.safe_dump` makes the markdown export safe whatever is in the list, so
+this filter is about what gets STORED and what reaches the Discord reply --
+defence at the boundary as well as at the sink.
 
-`yaml.safe_dump` now makes the export itself safe whatever is in the list, so
-this filter is about what gets STORED and what reaches the reply -- defence at
-the boundary as well as at the sink.
-
-These tests drive the REAL path. An earlier version of this file reimplemented
-the filter expression in a local helper and asserted against the copy, which
-left two mutants of the actual source alive: removing the
-`isinstance(raw_tags, list)` check, and widening the cap. The helper below is
-the one from test_classify_closed_set.py -- it mocks the HTTP response, so
-_classify_single parses a real model payload.
+These drive the REAL path: the `_classifier` helper mocks the HTTP response so
+`_classify_single` parses a genuine model payload, rather than asserting
+against a copy of the filter expression.
 """
 
 from __future__ import annotations

@@ -295,12 +295,9 @@ class ReflexClassifier:
             confidence = self._confidence(data, "classification")
 
             reasoning = data.get("reasoning", "")
-            # The list check alone left ELEMENTS unvalidated, and a
-            # non-string one raised TypeError in two separate `', '.join`
-            # calls -- the markdown export (silently, in a daemon thread) and
-            # the Discord reply. Drop anything that is not a usable string and
-            # cap the count, so a model returning 500 tags or [{"a": 1}]
-            # cannot reach either sink.
+            # Elements, not just the list: a non-string tag reaches several
+            # `', '.join` calls in bot.py and the database. Drop anything that
+            # is not a usable string and cap the count.
             raw_tags = data.get("suggested_tags", [])
             if not isinstance(raw_tags, list):
                 logger.warning(
@@ -311,9 +308,8 @@ class ReflexClassifier:
             suggested_tags = [t for t in raw_tags if isinstance(t, str) and t.strip()][
                 :MAX_SUGGESTED_TAGS
             ]
-            # Say so rather than swallowing: a silent drop is what made the
-            # original bug invisible, and a model that keeps sending junk
-            # tags should be visible in the logs.
+            # Logged, not swallowed: a model that keeps sending junk tags
+            # should be visible without reading the database.
             if len(suggested_tags) != len(raw_tags):
                 logger.warning(
                     f"dropped {len(raw_tags) - len(suggested_tags)} of "

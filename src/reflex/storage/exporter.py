@@ -99,27 +99,20 @@ class MarkdownExporter:
         assert entry.captured_at is not None, "Entry must have captured_at for export"
         captured_at = entry.captured_at  # Narrow type for mypy
 
-        # YAML frontmatter, SERIALISED rather than interpolated.
+        # YAML frontmatter, SERIALISED rather than interpolated: safe_dump
+        # quotes every value, so no model-supplied one can add structure.
         #
-        # Every value here is model-supplied or model-influenced. The previous
-        # hand-built form rendered tags as `tags: [{', '.join(entry.tags)}]`,
-        # so a tag containing `]` and a newline could close the list and add
-        # its own keys -- forging `category` and `status` past the closed set
-        # that classifier.py enforces, in the one artifact a human and
-        # Obsidian read, and in a file that is git-committed and pushed.
-        #
-        # safe_dump quotes whatever it is given, so no value can introduce
-        # structure. It also cannot raise on a non-string tag, where
-        # `', '.join` did -- inside a daemon thread whose `except Exception`
-        # swallowed it, losing the export while the user saw a tick.
-        #
-        # default_flow_style=None keeps `tags: [a, b]` inline as before;
-        # sort_keys=False keeps the field order.
+        # default_flow_style=None keeps `tags: [a, b]` inline and
+        # sort_keys=False keeps the field order, both as the previous format
+        # had them; allow_unicode=True keeps non-ASCII readable. All three are
+        # pinned by test_the_rendered_text_keeps_the_previous_file_shape and
+        # test_a_non_ascii_tag_survives_unescaped.
         frontmatter = (
             "---\n"
             + yaml.safe_dump(
                 {
                     "id": entry.id,
+                    # Kept a string, as the old template had it quoted.
                     "discord_message_id": str(entry.discord_message_id),
                     "category": entry.category,
                     "tags": list(entry.tags) if entry.tags else [],
