@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 import git
+import yaml
 from cortex_utils.logging import get_logger
 from slugify import slugify
 
@@ -98,19 +99,34 @@ class MarkdownExporter:
         assert entry.captured_at is not None, "Entry must have captured_at for export"
         captured_at = entry.captured_at  # Narrow type for mypy
 
-        # YAML frontmatter
-        frontmatter = f"""---
-id: {entry.id}
-discord_message_id: "{entry.discord_message_id}"
-category: {entry.category}
-tags: [{', '.join(entry.tags) if entry.tags else ''}]
-captured_at: {captured_at.isoformat()}
-llm_model: {entry.llm_model}
-llm_confidence: {entry.llm_confidence}
-status: {entry.status}
----
-
-"""
+        # YAML frontmatter, SERIALISED rather than interpolated: safe_dump
+        # quotes every value, so no model-supplied one can add structure.
+        #
+        # default_flow_style=None keeps `tags: [a, b]` inline and
+        # sort_keys=False keeps the field order, both as the previous format
+        # had them; allow_unicode=True keeps non-ASCII readable. All three are
+        # pinned by test_the_rendered_text_keeps_the_previous_file_shape and
+        # test_a_non_ascii_tag_survives_unescaped.
+        frontmatter = (
+            "---\n"
+            + yaml.safe_dump(
+                {
+                    "id": entry.id,
+                    # Kept a string, as the old template had it quoted.
+                    "discord_message_id": str(entry.discord_message_id),
+                    "category": entry.category,
+                    "tags": list(entry.tags) if entry.tags else [],
+                    "captured_at": captured_at.isoformat(),
+                    "llm_model": entry.llm_model,
+                    "llm_confidence": entry.llm_confidence,
+                    "status": entry.status,
+                },
+                default_flow_style=None,
+                sort_keys=False,
+                allow_unicode=True,
+            )
+            + "---\n\n"
+        )
 
         # Title
         title = f"# {entry.title}\n\n"

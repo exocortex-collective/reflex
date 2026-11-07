@@ -58,6 +58,10 @@ Return JSON:
 # this one is here to avoid; keep both in step.
 VALID_CATEGORIES = frozenset({"person", "project", "idea", "admin", "inbox"})
 
+# A model returning hundreds of tags should not fill the frontmatter or the
+# Discord reply. The number is arbitrary; the cap is the point.
+MAX_SUGGESTED_TAGS = 20
+
 
 class ReflexClassifier:
     """Two-tier LLM classifier for Reflex captures."""
@@ -291,9 +295,27 @@ class ReflexClassifier:
             confidence = self._confidence(data, "classification")
 
             reasoning = data.get("reasoning", "")
-            suggested_tags = data.get("suggested_tags", [])
-            if not isinstance(suggested_tags, list):
-                suggested_tags = []
+            # Elements, not just the list: a non-string tag reaches several
+            # `', '.join` calls in bot.py and the database. Drop anything that
+            # is not a usable string and cap the count.
+            raw_tags = data.get("suggested_tags", [])
+            if not isinstance(raw_tags, list):
+                logger.warning(
+                    f"model returned suggested_tags of type "
+                    f"{type(raw_tags).__name__}, not a list; dropping all tags"
+                )
+                raw_tags = []
+            suggested_tags = [t for t in raw_tags if isinstance(t, str) and t.strip()][
+                :MAX_SUGGESTED_TAGS
+            ]
+            # Logged, not swallowed: a model that keeps sending junk tags
+            # should be visible without reading the database.
+            if len(suggested_tags) != len(raw_tags):
+                logger.warning(
+                    f"dropped {len(raw_tags) - len(suggested_tags)} of "
+                    f"{len(raw_tags)} suggested_tags (non-string, blank, or "
+                    f"over the cap of {MAX_SUGGESTED_TAGS})"
+                )
 
             # `is True`, not bool(), for the same reason as is_command above:
             # bool("false") is True, so a model SAYING not-actionable was
