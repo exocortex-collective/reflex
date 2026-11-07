@@ -297,10 +297,23 @@ class ReflexClassifier:
             # cannot reach either sink.
             raw_tags = data.get("suggested_tags", [])
             if not isinstance(raw_tags, list):
+                logger.warning(
+                    f"model returned suggested_tags of type "
+                    f"{type(raw_tags).__name__}, not a list; dropping all tags"
+                )
                 raw_tags = []
             suggested_tags = [t for t in raw_tags if isinstance(t, str) and t.strip()][
                 :MAX_SUGGESTED_TAGS
             ]
+            # Say so rather than swallowing: a silent drop is what made the
+            # original bug invisible, and a model that keeps sending junk
+            # tags should be visible in the logs.
+            if len(suggested_tags) != len(raw_tags):
+                logger.warning(
+                    f"dropped {len(raw_tags) - len(suggested_tags)} of "
+                    f"{len(raw_tags)} suggested_tags (non-string, blank, or "
+                    f"over the cap of {MAX_SUGGESTED_TAGS})"
+                )
 
             # `is True`, not bool(), for the same reason as is_command above:
             # bool("false") is True, so a model SAYING not-actionable was

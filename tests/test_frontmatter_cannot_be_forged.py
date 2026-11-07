@@ -49,7 +49,9 @@ EXPECTED_KEYS = {
 def _entry(tags: list) -> Entry:
     return Entry(
         id=1,
-        discord_message_id="1460394971273363629",
+        # An INT, so the str() coercion in the exporter is pinned: with a
+        # str here the coercion is a no-op and its removal survived.
+        discord_message_id=1460394971273363629,  # type: ignore[arg-type]
         discord_channel_id="1460394971273363629",
         discord_user_id="509879976879718411",
         category="idea",
@@ -68,7 +70,9 @@ def _frontmatter(tags: list) -> dict:
     """Render and parse back. Unbound so no git repo is needed to construct one."""
     md = MarkdownExporter._generate_markdown(None, _entry(tags))  # type: ignore[arg-type]
     assert md.startswith("---\n")
-    return yaml.safe_load(md.split("---")[1])
+    # split("---\n", 2): a tag containing `---` would otherwise
+    # break the TEST rather than the code under test.
+    return yaml.safe_load(md.split("---\n", 2)[1])
 
 
 def test_a_crafted_tag_cannot_add_frontmatter_keys():
