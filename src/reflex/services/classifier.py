@@ -336,21 +336,6 @@ class ReflexClassifier:
                 actionable=actionable,
             )
 
-            # `is True`, not bool(), for the same reason as is_command above:
-            # bool("false") is True, so a model SAYING not-actionable was
-            # stored as actionable. Absent or any other value means not
-            # actionable, the direction that fails quiet.
-            actionable = data.get("actionable") is True
-
-            return ClassificationResult(
-                category=category,
-                confidence=confidence,
-                reasoning=reasoning,
-                suggested_tags=suggested_tags,
-                model=model,
-                actionable=actionable,
-            )
-
         except json.JSONDecodeError as e:
             logger.error(f"Classification returned invalid JSON: {e}")
             raise LLMError(f"Invalid JSON: {e}") from e

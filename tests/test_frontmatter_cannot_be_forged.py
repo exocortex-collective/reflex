@@ -31,6 +31,8 @@ from reflex.models.entry import Entry
 from reflex.services.classifier import MAX_SUGGESTED_TAGS
 from reflex.storage.exporter import MarkdownExporter
 
+from .test_suggested_tags_are_filtered import _tags as _classify_with_tags
+
 # The exact string from cortex-57q3, which the original review demonstrated.
 INJECTION = "x]\ncategory: admin\nstatus: archived\nz: ["
 
@@ -105,3 +107,64 @@ def test_the_ordinary_frontmatter_is_unchanged_in_shape():
 
 def test_no_tags_still_renders():
     assert _frontmatter([])["tags"] == []
+
+
+def test_the_rendered_text_keeps_the_previous_file_shape():
+    """The serialiser OPTIONS, not the parsed result.
+
+    `default_flow_style=None` and `sort_keys=False` are there to keep the file
+    looking as it did -- an inline tag list and the original field order. Every
+    other test here parses the YAML back, so all three options could be
+    changed without failing anything. This one reads the text.
+    """
+    md = MarkdownExporter._generate_markdown(None, _entry(["reading", "ml"]))  # type: ignore[arg-type]
+    body = md.split("---\n", 2)[1]
+    lines = [line.split(":", 1)[0] for line in body.splitlines() if line and not line[0].isspace()]
+    assert lines == [
+        "id",
+        "discord_message_id",
+        "category",
+        "tags",
+        "captured_at",
+        "llm_model",
+        "llm_confidence",
+        "status",
+    ], "field order changed; sort_keys must stay False"
+    assert "tags: [reading, ml]" in body, (
+        "the tag list is no longer inline; default_flow_style must stay None"
+    )
+
+
+def test_a_dropped_tag_count_is_logged(monkeypatch):
+    """A silent drop is what made the original bug invisible.
+
+    The module's logger is replaced rather than captured. caplog does not see
+    structlog output, and capsys does but only when no other test has
+    reconfigured logging -- I tried both, and each passed in one arrangement
+    and failed in the other. Who the code CALLS is the behaviour worth
+    pinning, and it does not depend on global logging state.
+    """
+    from reflex.services import classifier as mod
+
+    said: list[str] = []
+    monkeypatch.setattr(mod.logger, "warning", lambda msg, *a, **k: said.append(str(msg)))
+    _classify_with_tags([1, "ok", "  ", {"a": 2}])
+    assert any("dropped 3 of 4 suggested_tags" in m for m in said), said
+
+
+def test_a_non_list_tags_value_is_logged(monkeypatch):
+    from reflex.services import classifier as mod
+
+    said: list[str] = []
+    monkeypatch.setattr(mod.logger, "warning", lambda msg, *a, **k: said.append(str(msg)))
+    _classify_with_tags("urgent")
+    assert any("not a list" in m and "str" in m for m in said), said
+
+
+def test_a_non_ascii_tag_survives_unescaped():
+    """Pins allow_unicode=True: without it safe_dump escapes non-ASCII to
+    \\uXXXX, which is valid YAML but unreadable in the vault."""
+    fm = _frontmatter(["café", "日本語"])
+    assert fm["tags"] == ["café", "日本語"]
+    md = MarkdownExporter._generate_markdown(None, _entry(["café"]))  # type: ignore[arg-type]
+    assert "café" in md, "non-ASCII was escaped; allow_unicode must stay True"

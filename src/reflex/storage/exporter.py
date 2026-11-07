@@ -151,7 +151,9 @@ class MarkdownExporter:
 
         return frontmatter + title + original + metadata
 
-    def commit_and_push(self, filepath: str, entry: Entry, push: bool = True) -> Optional[str]:
+    def commit_and_push(
+        self, filepath: str, entry: Entry, push: bool = True
+    ) -> Optional[str]:
         """Commit file and optionally push to remote.
 
         Args:
@@ -215,4 +217,6 @@ class MarkdownExporter:
                 logger.error(f"Failed to commit entry {entry.id}")
 
         except Exception as e:
-            logger.error(f"Failed to export/commit entry {entry.id}: {e}", exc_info=True)
+            logger.error(
+                f"Failed to export/commit entry {entry.id}: {e}", exc_info=True
+            )
