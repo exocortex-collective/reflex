@@ -63,6 +63,23 @@ VALID_CATEGORIES = frozenset({"person", "project", "idea", "admin", "inbox"})
 MAX_SUGGESTED_TAGS = 20
 
 
+def clean_tags(raw: object) -> list[str]:
+    """The usable tags in a model-supplied value.
+
+    Shared by the classification path and the bot's tag command, which had
+    diverged: one checked the type and the other did not. `set.update("urgent")`
+    adds each CHARACTER, so with a bare string the TYPE is the bug rather than
+    the content, and a model sending one where a list is specified is an
+    ordinary model error.
+
+    Filters only -- it does not rewrite values, so a legitimate tag survives
+    unchanged.
+    """
+    if not isinstance(raw, list):
+        return []
+    return [t for t in raw if isinstance(t, str) and t.strip()][:MAX_SUGGESTED_TAGS]
+
+
 class ReflexClassifier:
     """Two-tier LLM classifier for Reflex captures."""
 
@@ -305,9 +322,7 @@ class ReflexClassifier:
                     f"{type(raw_tags).__name__}, not a list; dropping all tags"
                 )
                 raw_tags = []
-            suggested_tags = [t for t in raw_tags if isinstance(t, str) and t.strip()][
-                :MAX_SUGGESTED_TAGS
-            ]
+            suggested_tags = clean_tags(raw_tags)
             # Logged, not swallowed: a model that keeps sending junk tags
             # should be visible without reading the database.
             if len(suggested_tags) != len(raw_tags):
