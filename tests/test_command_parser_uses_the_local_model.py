@@ -877,7 +877,7 @@ PING_ONLY_SHAPES = [
     "value,shape", PING_ONLY_SHAPES, ids=[s for _, s in PING_ONLY_SHAPES]
 )
 def test_a_ping_only_allow_list_is_accepted(value, shape):
-    """Both arms of `_is_ping_only_call`, which rejection cases cannot reach.
+    """Deleting either arm of `_is_ping_only_call`, which no rejection case can kill.
 
     Measured: the live sites pass a bare `_ping_only(user)`, so the real-source
     guard already kills the Name arm -- but dropping the ATTRIBUTE arm survived
@@ -911,9 +911,11 @@ def test_any_allow_list_that_is_not_ping_only_is_rejected(value, shape):
     if it were an allow-list of one, which is why a bare Name call is in the
     table alongside an attribute call.
 
-    These three cannot pin either arm of `_is_ping_only_call`, because all
-    three are non-`_ping_only` and the arms decide what is ACCEPTED --
-    test_a_ping_only_allow_list_is_accepted does that.
+    These three cannot kill the DELETION of either arm of
+    `_is_ping_only_call`, since all three are non-`_ping_only` and the arms
+    decide what is ACCEPTED -- test_a_ping_only_allow_list_is_accepted does
+    that. Each call form IS the only kill for its own arm's identity test
+    turned tautology, which is why both shapes stay in the table.
     """
     import ast
     import textwrap
