@@ -107,7 +107,14 @@ uv run black src tests
 
 ## Deployment
 
-- Docker image: `us-central1-docker.pkg.dev/cortex-gmail/cortex/reflex:latest`
+- Docker image: `ghcr.io/exocortex-collective/reflex`, tagged with the commit
+  sha AND `latest` by `.github/workflows/build.yml` (`IMAGE_NAME` at line 11).
+  **Not** `us-central1-docker.pkg.dev/...`, which this file claimed until
+  2026-11-08 and which nothing in `.github/` references. The package is
+  PRIVATE, so `docker pull` on ares fails `unauthorized`; pre-pull through
+  Portainer instead, with `X-Registry-Auth` as a HEADER carrying
+  base64 of `{"registryId":2}` (registry 2 is GHCR; the `registryId` query
+  parameter 401s).
 - **Runs on ares**, not Hades. Measured 2026-11-08 via the Portainer API:
   stack id 70, name `reflex`, endpoint 3 (ares). `docker ps` on ares shows
   `reflex-bot`. The other cortex services do run on Hades, which is where the
