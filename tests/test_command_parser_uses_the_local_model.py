@@ -748,9 +748,9 @@ async def test_the_custom_snooze_prompt_still_pings_the_user():
 def _mentioning_sends(tree: "ast.AST") -> list["ast.Call"]:
     """Every `.reply`/`.send` call in `tree` whose message mentions someone.
 
-    Module-level so the synthetic test below drives the SAME walk the guard
-    uses. A walk that is its own test's source of truth proves nothing -- the
-    frozenset lesson from the category guard, one file over.
+    Module-level so the synthetic tests below drive the SAME walk the guard
+    applies to bot.py. Their expected values are literals, not computed by
+    this function, so sharing it does not make it their oracle.
     """
     import ast
 
@@ -804,7 +804,7 @@ def _is_ping_only_call(node: "ast.expr | None") -> bool:
 
 
 def _allow_list_violations(tree: "ast.AST") -> tuple[list[int], list[int]]:
-    """(lines with no allow-list, lines whose allow-list is wider than one id).
+    """(lines with no allow-list, lines whose allow-list is not _ping_only).
 
     Shared by the real-source guard and the synthetic tests below. bot.py
     contains no violating send, so an assertion written only against bot.py
@@ -828,6 +828,7 @@ SEND_SHAPES = [
     ('await m.reply(f"{m.author.mention} hi")', "mention via another object"),
     ('await m.reply(f"{member.mention} hi")', "mention via another name"),
     ('await m.reply(f"<@{user.id}> hi")', "hand-spelled mention"),
+    ('await m.reply(f"ok, <@{user.id}>")', "hand-spelled, not at position 0"),
     ('await m.channel.send(f"{user.mention} hi")', "channel.send"),
 ]
 
@@ -851,6 +852,48 @@ def test_the_mention_walk_sees_every_shape_it_claims_to(src, shape):
     missing, wrong = _allow_list_violations(tree)
     assert missing == [found[0].lineno], (
         f"a {shape} with no allow-list must be reported missing "
+        f"(missing={missing}, wrong={wrong})"
+    )
+    assert wrong == [], (
+        "a send with no allow-list at all is MISSING, not wrong -- the two "
+        f"lists must not both claim it (wrong={wrong})"
+    )
+
+
+WIDER_ALLOW_LISTS = [
+    ("AM.all()", "an attribute call"),
+    ("AllowedMentions(everyone=True)", "a bare name call"),
+    ("None", "not a call at all"),
+]
+
+
+@pytest.mark.parametrize(
+    "value,shape", WIDER_ALLOW_LISTS, ids=[s for _, s in WIDER_ALLOW_LISTS]
+)
+def test_any_allow_list_that_is_not_ping_only_is_rejected(value, shape):
+    """The value check, on more than one shape.
+
+    Pinned on three because the check is a disjunction over call forms: with
+    only an attribute call in the table, dropping the Name arm or replacing
+    the identity test with a tautology both survive, and the silent direction
+    is a bare `AllowedMentions(everyone=True)` passing as if it were an
+    allow-list of one.
+    """
+    import ast
+    import textwrap
+
+    tree = ast.parse(
+        textwrap.dedent(
+            f"""
+            async def f(m, user):
+                await m.reply(f"{{user.mention}} hi", allowed_mentions={value})
+            """
+        )
+    )
+    missing, wrong = _allow_list_violations(tree)
+    assert missing == [], f"the keyword is present for {shape}"
+    assert wrong == [3], (
+        f"{shape} is not a _ping_only(...) call and must be reported wrong "
         f"(missing={missing}, wrong={wrong})"
     )
 
@@ -1130,15 +1173,11 @@ def test_a_tier_2_type_error_still_keeps_the_storable_tier_1_answer(caplog):
 def test_a_tier_1_type_error_still_escalates_to_tier_2():
     """The leg where a narrow catch costs the WHOLE cascade, not a fallback.
 
-    Round 4 widened the tier-2 keep branch on the argument that
-    `_post_completion`'s documented exception set is incomplete, and left both
-    tier-1 handlers narrow -- where the same `{"choices": 5}` envelope escaped
-    as TypeError and tier 2 was never asked at all. Measured then: the capture
-    was lost with an error reaction and nothing retrying, strictly worse than
-    the case the fix addressed.
-
-    Broadening a tier-1 handler cannot invent or keep an answer; there is none
-    yet. It can only let tier 2 run.
+    A `{"choices": 5}` envelope from the tier-1 model escaped a narrow tuple
+    as a bare TypeError, so tier 2 was never asked and the capture was lost
+    outright -- worse than the tier-2 case, where the cost is only a lost
+    fallback. Broadening a tier-1 handler cannot invent or keep an answer;
+    there is none yet, so it can only let tier 2 run.
     """
     import httpx
 
@@ -1244,3 +1283,98 @@ def test_a_failed_capture_is_not_counted_twice():
         "a failure that propagates is counted by on_message; counting it "
         "here too double-counts one event"
     )
+
+
+# ---------------------------------------------------------------------------
+# The handlers catch Exception. The tests above reach a non-LLMError only
+# through one cortex-utils internal, and utils-f643 is open to fix exactly
+# that -- at which point {"choices": 5} raises LLMError, a narrow tuple would
+# catch it too, and those tests would keep passing while guarding nothing.
+#
+# These raise from reflex's OWN seam instead, so the coverage does not expire
+# on a pin bump. The method under test is the HANDLER; _classify_single and
+# _validate_intent_single are its collaborators, which is why patching them is
+# not stubbing the thing under test.
+# ---------------------------------------------------------------------------
+
+
+def _classifier():
+    from reflex.services.classifier import ReflexClassifier
+
+    c = ReflexClassifier("http://proxy.test", "t1", "t2", api_key="k")
+    c.llm.client.close()
+    return c
+
+
+def test_a_non_llm_error_from_tier_1_still_escalates():
+    """A reflex-side fault in tier 1 must not skip tier 2."""
+    from reflex.models.entry import ClassificationResult
+
+    c = _classifier()
+    good = ClassificationResult(
+        category="idea", confidence=0.9, reasoning="r", suggested_tags=[], model="t2"
+    )
+    calls: list[str] = []
+
+    def fake(message: str, model: str):
+        calls.append(model)
+        if model == "t1":
+            raise ValueError("a reflex-side bug, not an LLMError")
+        return good
+
+    with mock.patch.object(c, "_classify_single", side_effect=fake):
+        result = c.classify("an idea")
+
+    assert calls == ["t1", "t2"], "tier 2 must be asked after a non-LLMError"
+    assert result is good
+
+
+def test_a_non_llm_error_from_tier_2_keeps_the_storable_tier_1_answer():
+    """And must not discard a storable tier-1 answer."""
+    from reflex.models.entry import ClassificationResult
+
+    c = _classifier()
+    tier1 = ClassificationResult(
+        category="idea", confidence=0.65, reasoning="r", suggested_tags=[], model="t1"
+    )
+
+    def fake(message: str, model: str):
+        if model == "t1":
+            return tier1
+        raise ValueError("a reflex-side bug, not an LLMError")
+
+    with mock.patch.object(c, "_classify_single", side_effect=fake):
+        result = c.classify("an idea")
+
+    assert result is tier1
+
+
+def test_a_non_llm_error_from_tier_1_intent_validation_still_escalates():
+    """Same seam, the command path."""
+    c = _classifier()
+    calls: list[str] = []
+
+    def fake(message: str, model: str):
+        calls.append(model)
+        if model == "t1":
+            raise ValueError("a reflex-side bug, not an LLMError")
+        return True, 0.95
+
+    with mock.patch.object(c, "_validate_intent_single", side_effect=fake):
+        is_command, confidence = c.validate_intent("move that to project")
+
+    assert calls == ["t1", "t2"]
+    assert is_command is True
+
+
+def test_a_non_llm_error_from_tier_2_intent_validation_is_an_llm_error():
+    """And the documented contract holds for a non-LLMError too."""
+    from cortex_utils.llm import LLMError
+
+    c = _classifier()
+
+    with mock.patch.object(
+        c, "_validate_intent_single", side_effect=ValueError("reflex-side bug")
+    ):
+        with pytest.raises(LLMError):
+            c.validate_intent("move that to project")

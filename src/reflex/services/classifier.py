@@ -2,7 +2,6 @@
 
 import json
 
-import httpx
 from cortex_utils.llm import LLMClient, LLMError
 from cortex_utils.logging import get_logger
 from cortex_utils.metrics import ERRORS
@@ -145,11 +144,17 @@ class ReflexClassifier:
         # TypeError over the top of the LLMError (utils-f643). A narrow tuple
         # let that escape and tier 2 was never asked.
         #
-        # Cost, accepted: a deterministic AttributeError from a refactor of
-        # _validate_intent_single is now retried once against tier 2 before
-        # surfacing. One wasted call, and still an error.
+        # Cost, accepted: a reflex-side fault here -- an AttributeError from a
+        # refactor, say -- is now retried against tier 2 instead of failing
+        # locally. That sends the user's text to the CLOUD model on a path
+        # that previously would not have (see reflex-3379 for the standing
+        # version of that trade), and if tier 2 then succeeds the fault is
+        # invisible apart from this line. exc_info so it is diagnosable.
         except Exception as e:
-            logger.warning(f"Tier 1 intent validation failed: {e}, trying tier 2")
+            logger.warning(
+                f"Tier 1 intent validation failed: {e}, trying tier 2",
+                exc_info=True,
+            )
 
         # Escalate to Tier 2
         logger.info(
@@ -179,10 +184,12 @@ class ReflexClassifier:
 
         `null`, `5`, `[]` and `"x"` are all valid JSON. Only an object has the
         fields the guards below read, and reaching them with anything else
-        raises AttributeError (`data.get`) or TypeError (`"x" not in data`) --
-        neither of which is an LLMError, so classify()'s tier-1 handler does
-        not catch it, the cascade never reaches tier 2, and a raw exception
-        leaves the classifier.
+        raises AttributeError (`data.get`) or TypeError (`"x" not in data`).
+
+        Raising LLMError instead is what keeps the DIAGNOSIS: the cascade
+        catches Exception either way, but the tier-2 legs re-raise an LLMError
+        unchanged, so this message reaches the caller intact where a bare
+        TypeError is flattened to "tier 2 classification failed: TypeError".
         """
         if not isinstance(data, dict):
             raise LLMError(f"{where} returned JSON {type(data).__name__}, not an object")
@@ -272,10 +279,13 @@ class ReflexClassifier:
                     f"Classification tier 1: {result.category} (confidence={result.confidence})"
                 )
                 return result
-        # Exception, for the reason given on validate_intent's tier-1 handler:
-        # a miss here means tier 2 is never asked at all.
+        # Exception, for the reason given on validate_intent's tier-1 handler,
+        # including the same accepted cost: a miss here means tier 2 is never
+        # asked at all, and a reflex-side fault now reaches the cloud model.
         except Exception as e:
-            logger.warning(f"Tier 1 classification failed: {e}, trying tier 2")
+            logger.warning(
+                f"Tier 1 classification failed: {e}, trying tier 2", exc_info=True
+            )
             # Continue to tier 2
 
         # Escalate to Tier 2
@@ -367,8 +377,9 @@ class ReflexClassifier:
                 # reformatted, never mapped to a different member.
                 category = category.strip().strip("*_`").strip().lower()
             # isinstance first: `["admin"] not in VALID_CATEGORIES` raises
-            # TypeError (unhashable), which no handler here catches, so the
-            # cascade is skipped and the operator sees a raw TypeError.
+            # TypeError (unhashable), and a TypeError out of here is flattened
+            # to "tier 2 classification failed: TypeError" by the handler
+            # below, losing which value the model actually sent.
             if not isinstance(category, str) or category not in VALID_CATEGORIES:
                 raise LLMError(
                     f"model returned category {category!r}, which is not one of "
