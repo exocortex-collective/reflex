@@ -108,8 +108,14 @@ uv run black src tests
 ## Deployment
 
 - Docker image: `us-central1-docker.pkg.dev/cortex-gmail/cortex/reflex:latest`
-- Runs on Hades alongside other Cortex services
-- Portainer stack: `cortex-reflex`
+- **Runs on ares**, not Hades. Measured 2026-11-08 via the Portainer API:
+  stack id 70, name `reflex`, endpoint 3 (ares). `docker ps` on ares shows
+  `reflex-bot`. The other cortex services do run on Hades, which is where the
+  earlier "Runs on Hades alongside other Cortex services" came from -- it was
+  never true of reflex, and it would send a redeploy at the wrong host.
+- Portainer stack: **`reflex`** on ares (stack id 70), not `cortex-reflex`.
+  Devon sees stacks by name per environment rather than by number, so refer to
+  it as "the reflex stack on ares".
 
 ## Coding Style
 
