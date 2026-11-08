@@ -134,11 +134,21 @@ class ReflexClassifier:
                     f"Intent validation tier 1: is_command={is_command}, confidence={confidence}"
                 )
                 return is_command, confidence
-        # httpx.RequestError TOO, not just LLMError. _post_completion lets a
-        # transport failure through unwrapped -- the six public methods of
-        # LLMClient convert it, and reflex does not use them -- so a proxy
-        # that is down would otherwise skip tier 2 entirely.
-        except (LLMError, httpx.RequestError) as e:
+        # A TIER-1 handler catches Exception, and the breadth is safer here
+        # than anywhere else in this file: all it can do is let tier 2 run.
+        # It cannot invent or keep an answer, because there is none yet.
+        #
+        # It has to be this broad. _post_completion documents four raisable
+        # types and that list is INCOMPLETE: _reject_if_truncated runs inside
+        # its own `except LLMError` block and iterates `choices` without a
+        # type check, so a 200 carrying {"choices": 5} raises a bare
+        # TypeError over the top of the LLMError (utils-f643). A narrow tuple
+        # let that escape and tier 2 was never asked.
+        #
+        # Cost, accepted: a deterministic AttributeError from a refactor of
+        # _validate_intent_single is now retried once against tier 2 before
+        # surfacing. One wasted call, and still an error.
+        except Exception as e:
             logger.warning(f"Tier 1 intent validation failed: {e}, trying tier 2")
 
         # Escalate to Tier 2
@@ -154,8 +164,10 @@ class ReflexClassifier:
             is_command, confidence = self._validate_intent_single(
                 message, self.tier2_model
             )
-        except httpx.RequestError as e:
-            raise LLMError(f"tier 2 transport failure: {type(e).__name__}") from e
+        except LLMError:
+            raise
+        except Exception as e:
+            raise LLMError(f"tier 2 intent validation failed: {type(e).__name__}") from e
         logger.info(
             f"Intent validation tier 2: is_command={is_command}, confidence={confidence}"
         )
@@ -260,8 +272,9 @@ class ReflexClassifier:
                     f"Classification tier 1: {result.category} (confidence={result.confidence})"
                 )
                 return result
-        # httpx.RequestError TOO; see validate_intent.
-        except (LLMError, httpx.RequestError) as e:
+        # Exception, for the reason given on validate_intent's tier-1 handler:
+        # a miss here means tier 2 is never asked at all.
+        except Exception as e:
             logger.warning(f"Tier 1 classification failed: {e}, trying tier 2")
             # Continue to tier 2
 
@@ -276,21 +289,21 @@ class ReflexClassifier:
         # bar, so a band of answers escalate and would still have been filed
         # -- and letting tier 2's failure propagate threw those away.
         #
-        # `except Exception` deliberately, for the KEEP branch only.
-        # _post_completion is private, so its exception set changes on every
-        # pin bump with no signal: a 200 carrying {"choices": 5} raises
-        # TypeError, which a narrow tuple missed, discarding the answer
-        # exactly as before the fallback existed.
+        # This handler governs all three outcomes below, not just the keep:
+        # a non-LLMError that reaches the end of it is wrapped AS an LLMError,
+        # so the breadth also changes what the caller sees when nothing is
+        # kept. See the tier-1 handlers for why it has to be this broad.
         try:
             tier2 = self._classify_single(message, self.tier2_model)
         except Exception as e:
-            # Counted, not just logged. classifier.py owns no metrics, so
-            # before the fallback the propagating exception WAS the signal:
-            # it reached on_message and incremented ERRORS. Keeping the
-            # answer silently would make an expired tier-2 key look like a
-            # model that merely agrees.
-            ERRORS.labels(service="reflex", error_type="classify_tier2").inc()
             if result is not None and result.confidence >= self.tier2_threshold:
+                # Counted, because this is the one outcome that is otherwise
+                # SILENT: the capture succeeds on the tier-1 answer, so
+                # nothing else in the estate records that tier 2 is down and
+                # an expired key looks like a model that merely agrees. The
+                # paths below raise, and on_message counts those already --
+                # incrementing here too would double-count one failure.
+                ERRORS.labels(service="reflex", error_type="classify_tier2").inc()
                 logger.warning(
                     f"Tier 2 classification failed: {e}; keeping the storable "
                     f"tier-1 answer {result.category} "

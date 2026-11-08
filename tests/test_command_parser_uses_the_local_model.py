@@ -533,11 +533,16 @@ def test_a_tier_2_transport_failure_in_intent_validation_is_an_llm_error():
     assert seen == ["t1", "t2"], "both legs must be attempted"
 
 
-def test_a_tier_2_failure_keeps_the_usable_tier_1_classification():
-    """0.65 escalates (< tier1_threshold 0.7) but is storable (>= 0.6, the
-    bar handle_capture actually gates on), so letting tier 2's failure
-    propagate threw away a result that would have been filed normally -- the
-    capture became "Sorry, something went wrong" with nothing retrying.
+@pytest.mark.parametrize("conf", [0.6, 0.65], ids=["at-the-bar", "above-it"])
+def test_a_tier_2_failure_keeps_the_usable_tier_1_classification(conf):
+    """A confidence that escalates but is still storable must survive tier 2
+    failing, or the capture is lost to "Sorry, something went wrong" with
+    nothing retrying.
+
+    0.6 is the BOUNDARY and is tested because the guard is `>=`: handle_capture
+    gates on `< tier2_threshold`, so exactly 0.6 is stored. Without this case
+    `>=` could be mutated to `>` and survive the whole suite -- the `at` half
+    of "at or above" was the untested half.
     """
     import httpx
 
@@ -546,7 +551,7 @@ def test_a_tier_2_failure_keeps_the_usable_tier_1_classification():
     def handler(request: httpx.Request) -> httpx.Response:
         if '"t1"' in request.content.decode():
             seen.append("t1")
-            return _ok(GOOD_CLASSIFICATION.format(c=0.65))
+            return _ok(GOOD_CLASSIFICATION.format(c=conf))
         seen.append("t2")
         raise httpx.ConnectError("proxy died between the two calls")
 
@@ -557,7 +562,7 @@ def test_a_tier_2_failure_keeps_the_usable_tier_1_classification():
         c.llm.client.close()
     assert seen == ["t1", "t2"], "tier 2 must still be attempted"
     assert result.model == "t1", "the tier-1 answer must survive tier 2 failing"
-    assert result.confidence == 0.65
+    assert result.confidence == conf
 
 
 def test_both_tiers_failing_classification_is_still_an_llm_error():
@@ -717,10 +722,9 @@ def _bot_with_doubles():
 
 @pytest.mark.asyncio
 async def test_the_custom_snooze_prompt_still_pings_the_user():
-    """The regression this catches: AllowedMentions.none() on the client also
-    sets users=False and replied_user=False, and this prompt then WAITS in
-    snooze_pending for a reply -- so it arrived with no notification at all
-    and the entry stayed unsnoozed. No test touched this handler before.
+    """AllowedMentions.none() on the client also sets users=False, and this
+    prompt then WAITS in snooze_pending for a reply -- so with the mention
+    muted it arrives unnoticed and the entry stays unsnoozed.
     """
     import discord
 
@@ -741,6 +745,141 @@ async def test_the_custom_snooze_prompt_still_pings_the_user():
     assert (88, user.id) in bot.snooze_pending, "the reply it waits for is keyed here"
 
 
+def _mentioning_sends(tree: "ast.AST") -> list["ast.Call"]:
+    """Every `.reply`/`.send` call in `tree` whose message mentions someone.
+
+    Module-level so the synthetic test below drives the SAME walk the guard
+    uses. A walk that is its own test's source of truth proves nothing -- the
+    frozenset lesson from the category guard, one file over.
+    """
+    import ast
+
+    def mentions_someone(call: ast.Call) -> bool:
+        # Keywords too: `reply(content=f"{user.mention}")` slipped past a
+        # version that walked `call.args` alone. `allowed_mentions` is
+        # excluded, since _ping_only(user) is not a mention in the message.
+        trees = list(call.args) + [
+            k.value for k in call.keywords if k.arg != "allowed_mentions"
+        ]
+        nodes = [n for arg in trees for n in ast.walk(arg)]
+        # Any `<anything>.mention`, not just the name `user`:
+        # `message.author.mention` is the natural spelling in a capture
+        # handler and `member.mention` in a guild one, and both were
+        # invisible while this matched only one name.
+        attribute = any(
+            isinstance(n, ast.Attribute) and n.attr == "mention" for n in nodes
+        )
+        # A hand-spelled mention never touches `.mention`, so the attribute
+        # walk cannot see it. Matched on the literal prefix instead.
+        hand_spelled = any(
+            isinstance(n, ast.Constant) and isinstance(n.value, str) and "<@" in n.value
+            for n in nodes
+        )
+        return attribute or hand_spelled
+
+    return [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr in {"reply", "send"}
+        and mentions_someone(n)
+    ]
+
+
+def _allow_list_kwarg(call: "ast.Call") -> "ast.expr | None":
+    for k in call.keywords:
+        if k.arg == "allowed_mentions":
+            return k.value
+    return None
+
+
+def _is_ping_only_call(node: "ast.expr | None") -> bool:
+    import ast
+
+    return isinstance(node, ast.Call) and (
+        (isinstance(node.func, ast.Name) and node.func.id == "_ping_only")
+        or (isinstance(node.func, ast.Attribute) and node.func.attr == "_ping_only")
+    )
+
+
+def _allow_list_violations(tree: "ast.AST") -> tuple[list[int], list[int]]:
+    """(lines with no allow-list, lines whose allow-list is wider than one id).
+
+    Shared by the real-source guard and the synthetic tests below. bot.py
+    contains no violating send, so an assertion written only against bot.py
+    cannot be killed -- putting the logic here lets a mutation to it die on
+    source that does violate.
+    """
+    sends = _mentioning_sends(tree)
+    missing = [c.lineno for c in sends if _allow_list_kwarg(c) is None]
+    wrong = [
+        c.lineno
+        for c in sends
+        if _allow_list_kwarg(c) is not None
+        and not _is_ping_only_call(_allow_list_kwarg(c))
+    ]
+    return missing, wrong
+
+
+SEND_SHAPES = [
+    ('await m.reply(f"{user.mention} hi")', "positional f-string"),
+    ('await m.reply(content=f"{user.mention} hi")', "keyword argument"),
+    ('await m.reply(f"{m.author.mention} hi")', "mention via another object"),
+    ('await m.reply(f"{member.mention} hi")', "mention via another name"),
+    ('await m.reply(f"<@{user.id}> hi")', "hand-spelled mention"),
+    ('await m.channel.send(f"{user.mention} hi")', "channel.send"),
+]
+
+
+@pytest.mark.parametrize("src,shape", SEND_SHAPES, ids=[s for _, s in SEND_SHAPES])
+def test_the_mention_walk_sees_every_shape_it_claims_to(src, shape):
+    """Drives the walk on synthetic source, because bot.py contains only one
+    of these shapes today.
+
+    Without this, removing the hand-spelled match from the walk survives the
+    whole suite -- a forward guard with nothing to catch cannot be killed by
+    the real file, which is the same trap as the category closed set.
+    """
+    import ast
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(f"async def f(m, user, member):\n    {src}\n"))
+    found = _mentioning_sends(tree)
+    assert len(found) == 1, f"the walk must see a {shape}: {ast.dump(tree)}"
+    # Through the shared helper, so gutting its `missing` list dies here too.
+    missing, wrong = _allow_list_violations(tree)
+    assert missing == [found[0].lineno], (
+        f"a {shape} with no allow-list must be reported missing "
+        f"(missing={missing}, wrong={wrong})"
+    )
+
+
+def test_a_wider_allow_list_than_ping_only_is_rejected():
+    """The VALUE check. `allowed_mentions=AllowedMentions.all()` satisfies a
+    presence check and fully overrides the client default -- measured as
+    {'replied_user': True, 'parse': ['everyone','users','roles']} -- so an
+    echoed @everyone would ping the server through a passing test.
+    """
+    import ast
+    import textwrap
+
+    tree = ast.parse(
+        textwrap.dedent(
+            """
+            async def f(m, user):
+                await m.reply(f"{user.mention} hi", allowed_mentions=AM.all())
+            """
+        )
+    )
+    missing, wrong = _allow_list_violations(tree)
+    assert missing == [], "the keyword IS present, so this is not the missing case"
+    assert wrong == [3], (
+        "a non-_ping_only allow-list must be reported as wrong; presence is "
+        f"not enough (missing={missing}, wrong={wrong})"
+    )
+
+
 def test_every_deliberate_mention_passes_an_allow_list():
     """A pattern guard, so a NEW reply that pings is not silently muted by the
     client default.
@@ -749,77 +888,34 @@ def test_every_deliberate_mention_passes_an_allow_list():
     missed the snooze confirmation, whose message contains a parenthesised
     strftime call.
 
-    What this CANNOT see, stated so the guard is not mistaken for a proof: a
+    WHAT THIS CANNOT SEE, stated so the guard is not mistaken for a proof. A
     message built into a variable first (`msg = f"{user.mention}.."` then
-    `reply(msg)`) is invisible to any source-level walk. The value check below
-    is what limits the damage -- a send that reaches Discord with a wider
-    allow-list than _ping_only is the actual defect, and that is checked on
-    every mentioning send this can see.
+    `reply(msg)`) is invisible to any source-level walk, and such a send is
+    not even counted as mentioning -- so neither the presence check nor the
+    value check runs on it, and the count assertion is still satisfied.
+    Nothing here limits that case; the behavioural test per ping site is what
+    covers the sites that exist.
+
+    The shapes this DOES see are pinned on synthetic source by
+    test_the_mention_walk_sees_every_shape_it_claims_to, because bot.py
+    contains only one of them.
     """
-    import ast
     import inspect
 
     from reflex.services import bot as bot_module
 
+    import ast
+
     tree = ast.parse(inspect.getsource(bot_module))
-
-    def mentions_someone(call: ast.Call) -> bool:
-        """Any `<anything>.mention`, in a positional OR keyword argument.
-
-        Not `n.value.id == "user"`: `message.author.mention` is the natural
-        spelling in handle_capture and `member.mention` in a guild handler,
-        and both were invisible while this matched only the name `user`.
-        Keywords are walked too, because `reply(content=f"{user.mention}")`
-        slipped past a version that walked `call.args` alone.
-        """
-        trees = list(call.args) + [
-            k.value for k in call.keywords if k.arg != "allowed_mentions"
-        ]
-        return any(
-            isinstance(n, ast.Attribute) and n.attr == "mention"
-            for arg in trees
-            for n in ast.walk(arg)
-        )
-
-    sends = [
-        n
-        for n in ast.walk(tree)
-        if isinstance(n, ast.Call)
-        and isinstance(n.func, ast.Attribute)
-        and n.func.attr in {"reply", "send"}
-    ]
-    mentioning = [c for c in sends if mentions_someone(c)]
+    mentioning = _mentioning_sends(tree)
     assert mentioning, "the walk must still find the mentioning sends"
 
-    def allow_list_kwarg(call: ast.Call) -> ast.expr | None:
-        for k in call.keywords:
-            if k.arg == "allowed_mentions":
-                return k.value
-        return None
-
-    missing = [c.lineno for c in mentioning if allow_list_kwarg(c) is None]
-    assert not missing, (
+    missing, wrong_value = _allow_list_violations(tree)
+    assert missing == [], (
         f"sends at lines {missing} interpolate a mention with no "
         "allowed_mentions allow-list, so the client default mutes them"
     )
-
-    # The VALUE, not just the keyword. `allowed_mentions=AllowedMentions.all()`
-    # satisfies a presence check and fully overrides the client default --
-    # measured as {'replied_user': True, 'parse': ['everyone','users','roles']}
-    # -- so an echoed @everyone would ping the server.
-    def is_ping_only_call(node: ast.expr) -> bool:
-        return isinstance(node, ast.Call) and (
-            (isinstance(node.func, ast.Name) and node.func.id == "_ping_only")
-            or (
-                isinstance(node.func, ast.Attribute)
-                and node.func.attr == "_ping_only"
-            )
-        )
-
-    wrong_value = [
-        c.lineno for c in mentioning if not is_ping_only_call(allow_list_kwarg(c))
-    ]
-    assert not wrong_value, (
+    assert wrong_value == [], (
         f"sends at lines {wrong_value} pass an allowed_mentions that is not a "
         "_ping_only(...) call; anything wider can be widened by model text"
     )
@@ -833,14 +929,12 @@ def test_every_deliberate_mention_passes_an_allow_list():
 
 @pytest.mark.asyncio
 async def test_the_archive_confirmation_pings_the_reacting_user():
-    """The AST guard checks the keyword is PRESENT, not whom it allow-lists.
+    """The AST guard cannot see WHOM a send allow-lists, only that it does.
 
-    Measured: swapping `_ping_only(user)` for `_ping_only(reaction.message.author)`
-    here survived all 151 tests. Every one of these replies is to the BOT's own
-    message, so `reaction.message.author` IS the bot -- the allow-list becomes
-    the bot's id, Devon is notified of nothing, and the keyword is still there
-    so the pattern guard stays green. Only the custom-snooze site had a
-    behavioural test; this is the second of the three.
+    Every one of these replies is to the BOT's own message, so
+    `reaction.message.author` IS the bot: allow-listing it notifies nobody
+    while leaving the keyword in place, which the pattern guard accepts. Each
+    ping site needs its own behavioural test for that reason.
     """
     import discord
 
@@ -889,8 +983,8 @@ async def test_the_fixed_snooze_confirmation_pings_the_reacting_user():
 
 
 def test_a_tier_2_model_fault_keeps_the_models_own_diagnosis():
-    """The `isinstance(e, LLMError): raise` branch was uncovered -- deleting it
-    survived all 151 tests.
+    """Without the bare re-raise this branch wraps the model's own diagnosis
+    in a transport-failure message.
 
     Input that reaches it: tier 1 fails at the transport (so there is no
     tier-1 answer to keep) and tier 2 answers 200 with readable JSON that
@@ -930,10 +1024,14 @@ def test_a_tier_2_model_fault_keeps_the_models_own_diagnosis():
 
 
 def test_a_tier_2_fault_is_counted_even_when_the_tier_1_answer_is_kept():
-    """classifier.py owns no metrics, so before the fallback the propagating
-    exception WAS the signal -- it reached on_message, which increments
-    ERRORS. Keeping the tier-1 answer silently would make an expired tier-2
-    key indistinguishable from a tier 2 that merely agrees.
+    """The keep path is the only outcome nothing else records.
+
+    The capture SUCCEEDS on the tier-1 answer, so no exception reaches
+    on_message and nothing else in the estate notes that tier 2 failed -- an
+    expired tier-2 key would be indistinguishable from a tier 2 that merely
+    agrees. The paths that raise are counted by on_message already, which is
+    why the increment sits inside this branch rather than above it
+    (test_a_failed_capture_is_not_counted_twice pins the other half).
     """
     import httpx
     from cortex_utils.metrics import ERRORS
@@ -981,18 +1079,17 @@ def test_an_unstorable_tier_1_answer_is_not_kept():
         c.llm.client.close()
 
 
-def test_a_tier_2_type_error_still_keeps_the_storable_tier_1_answer():
-    """The reason the keep-branch catches `Exception` and not a tuple.
+def test_a_tier_2_type_error_still_keeps_the_storable_tier_1_answer(caplog):
+    """The reason the handlers catch `Exception` and not a tuple.
 
-    `_post_completion` is private, so its exception set changes on every pin
-    bump with no signal. In the pinned cortex-utils, a 200 carrying
-    `{"choices": 5}` makes `_reject_if_truncated` iterate a truthy
-    non-iterable and raise `TypeError` -- neither `LLMError` nor
-    `httpx.RequestError`. With a narrow tuple the fallback never ran and the
-    storable 0.65 was discarded exactly as before it existed, which is why
-    the first version of this fix only half-closed the finding.
+    `_post_completion` documents four raisable types and that list is
+    INCOMPLETE: `_reject_if_truncated` runs inside its own `except LLMError`
+    block and iterates `choices` with no type check, so a 200 carrying
+    `{"choices": 5}` raises a bare `TypeError` over the top of the LLMError
+    (utils-f643). A narrow tuple misses it and discards the storable answer.
 
-    A ConnectError cannot pin this: the narrow tuple catches that one.
+    A ConnectError cannot pin this -- a narrow tuple catches that one -- which
+    is why the assertion below is on the exception TYPE.
     """
     import httpx
 
@@ -1007,7 +1104,8 @@ def test_a_tier_2_type_error_still_keeps_the_storable_tier_1_answer():
 
     c = _classifier_on(handler)
     try:
-        result = c.classify("an idea about something")
+        with caplog.at_level("WARNING"):
+            result = c.classify("an idea about something")
     finally:
         c.llm.client.close()
 
@@ -1017,3 +1115,132 @@ def test_a_tier_2_type_error_still_keeps_the_storable_tier_1_answer():
         "the storable tier-1 answer standing"
     )
     assert result.confidence == 0.65
+    # The EXCEPTION TYPE, not just the outcome. Without this the three
+    # assertions above hold for any caught exception -- a plain LLMError body
+    # passes them identically -- so when utils-f643 lands and
+    # `_reject_if_truncated` stops leaking TypeError, this test would keep
+    # passing while silently ceasing to guard the widened catch, and the
+    # mutant that survived the first attempt would survive again.
+    assert "'int' object is not iterable" in caplog.text, (
+        "the caught fault must be the TypeError, not an LLMError that a "
+        f"narrow tuple would also have caught: {caplog.text}"
+    )
+
+
+def test_a_tier_1_type_error_still_escalates_to_tier_2():
+    """The leg where a narrow catch costs the WHOLE cascade, not a fallback.
+
+    Round 4 widened the tier-2 keep branch on the argument that
+    `_post_completion`'s documented exception set is incomplete, and left both
+    tier-1 handlers narrow -- where the same `{"choices": 5}` envelope escaped
+    as TypeError and tier 2 was never asked at all. Measured then: the capture
+    was lost with an error reaction and nothing retrying, strictly worse than
+    the case the fix addressed.
+
+    Broadening a tier-1 handler cannot invent or keep an answer; there is none
+    yet. It can only let tier 2 run.
+    """
+    import httpx
+
+    legs: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if '"t1"' in request.content.decode():
+            legs.append("t1")
+            return httpx.Response(200, json={"choices": 5})
+        legs.append("t2")
+        return _ok(GOOD_CLASSIFICATION.format(c=0.9))
+
+    c = _classifier_on(handler)
+    try:
+        result = c.classify("an idea")
+    finally:
+        c.llm.client.close()
+
+    assert legs == ["t1", "t2"], "tier 2 must be asked after a tier-1 fault"
+    assert result.model == "t2"
+
+
+def test_a_tier_1_type_error_in_intent_validation_still_escalates():
+    """Same gap, the other method. validate_intent's tier-1 handler was narrow
+    too, so command-shaped text hit a raw TypeError instead of a second
+    opinion.
+    """
+    import httpx
+
+    legs: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if '"t1"' in request.content.decode():
+            legs.append("t1")
+            return httpx.Response(200, json={"choices": 5})
+        legs.append("t2")
+        return _ok('{"is_command": true, "confidence": 0.95}')
+
+    c = _classifier_on(handler)
+    try:
+        is_command, confidence = c.validate_intent("move that to project")
+    finally:
+        c.llm.client.close()
+
+    assert legs == ["t1", "t2"]
+    assert is_command is True
+    assert confidence == 0.95
+
+
+def test_a_tier_2_type_error_in_intent_validation_is_an_llm_error():
+    """validate_intent's tier-2 leg wrapped only RequestError, so the same
+    envelope left it as a raw TypeError and `Raises: LLMError` was false for
+    the exact input the fix was built around.
+
+    No tier-1 fallback here by design -- this answer decides whether text is
+    executed as a command -- so the only question is whether the caller gets
+    the documented exception type.
+    """
+    import httpx
+    from cortex_utils.llm import LLMError
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"choices": 5})
+
+    c = _classifier_on(handler)
+    try:
+        with pytest.raises(LLMError):
+            c.validate_intent("move that to project")
+    finally:
+        c.llm.client.close()
+
+
+def test_a_failed_capture_is_not_counted_twice():
+    """The increment lives inside the KEEP branch, not above it.
+
+    On the paths that raise, the exception reaches `on_message`, which already
+    increments ERRORS under error_type=message_handler. Counting here as well
+    made one failed capture read as two in any sum over error_type. The keep
+    path is the only outcome nothing else records, because the capture
+    succeeds.
+    """
+    import httpx
+    from cortex_utils.llm import LLMError
+    from cortex_utils.metrics import ERRORS
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if '"t1"' in request.content.decode():
+            # Below tier2_threshold, so there is nothing storable to keep.
+            return _ok(GOOD_CLASSIFICATION.format(c=0.30))
+        raise httpx.ConnectError("tier 2 is down")
+
+    counter = ERRORS.labels(service="reflex", error_type="classify_tier2")
+    before = counter._value.get()
+
+    c = _classifier_on(handler)
+    try:
+        with pytest.raises(LLMError):
+            c.classify("an idea")
+    finally:
+        c.llm.client.close()
+
+    assert counter._value.get() == before, (
+        "a failure that propagates is counted by on_message; counting it "
+        "here too double-counts one event"
+    )
