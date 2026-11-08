@@ -378,8 +378,8 @@ class ReflexClassifier:
                 category = category.strip().strip("*_`").strip().lower()
             # isinstance first: `["admin"] not in VALID_CATEGORIES` raises
             # TypeError (unhashable), and a TypeError out of here is flattened
-            # to "tier 2 classification failed: TypeError" by the handler
-            # below, losing which value the model actually sent.
+            # to "tier 2 classification failed: TypeError" by the tier-2
+            # handler above, losing which value the model actually sent.
             if not isinstance(category, str) or category not in VALID_CATEGORIES:
                 raise LLMError(
                     f"model returned category {category!r}, which is not one of "

@@ -867,17 +867,53 @@ WIDER_ALLOW_LISTS = [
 ]
 
 
+PING_ONLY_SHAPES = [
+    ("_ping_only(user)", "a bare name call"),
+    ("self._ping_only(user)", "an attribute call"),
+]
+
+
+@pytest.mark.parametrize(
+    "value,shape", PING_ONLY_SHAPES, ids=[s for _, s in PING_ONLY_SHAPES]
+)
+def test_a_ping_only_allow_list_is_accepted(value, shape):
+    """Both arms of `_is_ping_only_call`, which rejection cases cannot reach.
+
+    Measured: the live sites pass a bare `_ping_only(user)`, so the real-source
+    guard already kills the Name arm -- but dropping the ATTRIBUTE arm survived
+    the whole suite, because nothing asserted that an attribute call is
+    accepted. A `self._ping_only(user)` spelling would then be reported as a
+    violation and the guard would fail loudly on correct code.
+    """
+    import ast
+    import textwrap
+
+    tree = ast.parse(
+        textwrap.dedent(
+            f"""
+            async def f(self, m, user):
+                await m.reply(f"{{user.mention}} hi", allowed_mentions={value})
+            """
+        )
+    )
+    missing, wrong = _allow_list_violations(tree)
+    assert missing == [], f"{shape} is an allow-list, not a missing one"
+    assert wrong == [], f"{shape} IS a _ping_only call and must be accepted"
+
+
 @pytest.mark.parametrize(
     "value,shape", WIDER_ALLOW_LISTS, ids=[s for _, s in WIDER_ALLOW_LISTS]
 )
 def test_any_allow_list_that_is_not_ping_only_is_rejected(value, shape):
-    """The value check, on more than one shape.
+    """Rejection, over three call forms.
 
-    Pinned on three because the check is a disjunction over call forms: with
-    only an attribute call in the table, dropping the Name arm or replacing
-    the identity test with a tautology both survive, and the silent direction
-    is a bare `AllowedMentions(everyone=True)` passing as if it were an
-    allow-list of one.
+    The silent direction is a bare `AllowedMentions(everyone=True)` passing as
+    if it were an allow-list of one, which is why a bare Name call is in the
+    table alongside an attribute call.
+
+    These three cannot pin either arm of `_is_ping_only_call`, because all
+    three are non-`_ping_only` and the arms decide what is ACCEPTED --
+    test_a_ping_only_allow_list_is_accepted does that.
     """
     import ast
     import textwrap
@@ -1161,9 +1197,11 @@ def test_a_tier_2_type_error_still_keeps_the_storable_tier_1_answer(caplog):
     # The EXCEPTION TYPE, not just the outcome. Without this the three
     # assertions above hold for any caught exception -- a plain LLMError body
     # passes them identically -- so when utils-f643 lands and
-    # `_reject_if_truncated` stops leaking TypeError, this test would keep
-    # passing while silently ceasing to guard the widened catch, and the
-    # mutant that survived the first attempt would survive again.
+    # `_reject_if_truncated` stops leaking TypeError, this test keeps passing
+    # while ceasing to exercise a non-LLMError -- so DELETE it then, rather
+    # than relaxing this assertion. The handlers stay covered either way: the
+    # seam tests below raise from reflex's own boundary and do not depend on
+    # cortex-utils behaviour at all.
     assert "'int' object is not iterable" in caplog.text, (
         "the caught fault must be the TypeError, not an LLMError that a "
         f"narrow tuple would also have caught: {caplog.text}"
@@ -1338,7 +1376,10 @@ def test_a_non_llm_error_from_tier_2_keeps_the_storable_tier_1_answer():
         category="idea", confidence=0.65, reasoning="r", suggested_tags=[], model="t1"
     )
 
+    calls: list[str] = []
+
     def fake(message: str, model: str):
+        calls.append(model)
         if model == "t1":
             return tier1
         raise ValueError("a reflex-side bug, not an LLMError")
@@ -1346,6 +1387,9 @@ def test_a_non_llm_error_from_tier_2_keeps_the_storable_tier_1_answer():
     with mock.patch.object(c, "_classify_single", side_effect=fake):
         result = c.classify("an idea")
 
+    # Its own premise: without this the test passes while tier 2 is never
+    # asked, which is the state it exists to rule out.
+    assert calls == ["t1", "t2"], "tier 2 must have been attempted"
     assert result is tier1
 
 
