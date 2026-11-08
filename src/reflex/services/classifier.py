@@ -5,6 +5,7 @@ import json
 import httpx
 from cortex_utils.llm import LLMClient, LLMError
 from cortex_utils.logging import get_logger
+from cortex_utils.metrics import ERRORS
 
 from reflex.models.entry import ClassificationResult
 
@@ -145,11 +146,10 @@ class ReflexClassifier:
             f"Intent validation tier 1 confidence {confidence:.2f} "
             f"< {self.tier1_threshold}, escalating"
         )
-        # Tier 2 is wrapped TOO. The handler above covers only the first leg,
-        # and a proxy that is down kills both -- so `Raises: LLMError` was
-        # false for exactly the condition that handler exists to survive.
-        # No tier-1 fallback here, unlike classify: this answer decides
-        # whether text is executed as a command, so it fails closed.
+        # A proxy that is down kills BOTH legs, so the handler above is not
+        # enough on its own. No tier-1 fallback here, unlike classify: this
+        # answer decides whether text is executed as a command, so it fails
+        # closed.
         try:
             is_command, confidence = self._validate_intent_single(
                 message, self.tier2_model
@@ -271,24 +271,41 @@ class ReflexClassifier:
                 f"Classification tier 1 confidence {result.confidence:.2f} "
                 f"< {self.tier1_threshold}, escalating"
             )
-        # A usable tier-1 answer beats an exception. `result` is set whenever
-        # tier 1 merely scored below tier1_threshold, and handle_capture
-        # stores anything at or above tier2_threshold (0.6, below the 0.7
-        # escalation bar) -- so letting tier 2's failure propagate discarded a
-        # result that would have been filed normally, and the capture was lost
-        # to "Sorry, something went wrong" with nothing retrying.
+        # A STORABLE tier-1 answer beats an exception. handle_capture files
+        # anything at or above tier2_threshold, which is below the escalation
+        # bar, so a band of answers escalate and would still have been filed
+        # -- and letting tier 2's failure propagate threw those away.
+        #
+        # `except Exception` deliberately, for the KEEP branch only.
+        # _post_completion is private, so its exception set changes on every
+        # pin bump with no signal: a 200 carrying {"choices": 5} raises
+        # TypeError, which a narrow tuple missed, discarding the answer
+        # exactly as before the fallback existed.
         try:
             tier2 = self._classify_single(message, self.tier2_model)
-        except (LLMError, httpx.RequestError) as e:
-            if result is not None:
+        except Exception as e:
+            # Counted, not just logged. classifier.py owns no metrics, so
+            # before the fallback the propagating exception WAS the signal:
+            # it reached on_message and incremented ERRORS. Keeping the
+            # answer silently would make an expired tier-2 key look like a
+            # model that merely agrees.
+            ERRORS.labels(service="reflex", error_type="classify_tier2").inc()
+            if result is not None and result.confidence >= self.tier2_threshold:
                 logger.warning(
-                    f"Tier 2 classification failed: {e}; keeping the tier-1 "
-                    f"answer {result.category} (confidence={result.confidence})"
+                    f"Tier 2 classification failed: {e}; keeping the storable "
+                    f"tier-1 answer {result.category} "
+                    f"(confidence={result.confidence})"
                 )
                 return result
+            # Below tier2_threshold there is nothing worth keeping, so the
+            # caller must hear about it rather than be handed an answer
+            # handle_capture would refuse anyway.
             if isinstance(e, LLMError):
+                # Re-raised unchanged: the model's own diagnosis ("category
+                # 'nope' is not one of ...") is more useful than a wrapper
+                # saying the transport failed, which it did not.
                 raise
-            raise LLMError(f"tier 2 transport failure: {type(e).__name__}") from e
+            raise LLMError(f"tier 2 classification failed: {type(e).__name__}") from e
         logger.info(
             f"Classification tier 2: {tier2.category} (confidence={tier2.confidence})"
         )
@@ -346,10 +363,9 @@ class ReflexClassifier:
                 )
             confidence = self._confidence(data, "classification")
 
-            # isinstance, like every field around it. This one reaches a
-            # Postgres %s for a `text` column, and psycopg2 ADAPTS a list to
-            # ARRAY[...] rather than refusing it, so a non-string gets as far
-            # as the server (reflex-cf96).
+            # Reaches a Postgres %s for a `text` column, and psycopg2
+            # ADAPTS a list to ARRAY[...] rather than refusing it, so an
+            # unchecked non-string gets as far as the server (reflex-cf96).
             reasoning = data.get("reasoning", "")
             if not isinstance(reasoning, str):
                 logger.warning(

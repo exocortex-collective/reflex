@@ -166,12 +166,14 @@ class ReflexBot(commands.Bot):
         # back to Discord verbatim -- the rejection path is exactly where an
         # arbitrary model-supplied value arrives -- and several other replies
         # interpolate model output. Set on the client so it covers every send,
-        # not the two that happen to be known.
+        # not only the ones currently known.
         #
-        # It is a DEFAULT, not a ban: none() also sets users=False and
-        # replied_user=False, which silently killed the three replies that
-        # deliberately ping Devon. Those pass an explicit per-send allow-list
-        # of one user id, which model text cannot widen.
+        # It is a DEFAULT, not a ban: none() also sets users=False, which
+        # silently killed the three replies that deliberately ping Devon.
+        # Those pass a per-send allow-list of one id, which model text cannot
+        # widen. That restores the MENTION ping only -- the merged value keeps
+        # replied_user=False -- so a reply meant to notify must interpolate
+        # the mention and cannot rely on the reply ping.
         super().__init__(
             command_prefix="!",
             intents=intents,
