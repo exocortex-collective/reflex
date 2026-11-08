@@ -143,6 +143,17 @@ Return ONLY valid JSON, no other text."""
                     )
                     return None
 
+            # A dict FIRST, like classifier.py's _object_or_raise. `in` on a
+            # string is substring containment, so json.loads('"action and
+            # target"') passes the presence test below and then raises
+            # TypeError on parsed["action"] -- into the blanket except, which
+            # refuses for an unnamed reason.
+            if not isinstance(parsed, dict):
+                logger.error(
+                    f"model returned JSON {type(parsed).__name__}, not an object"
+                )
+                return None
+
             # Validate required fields
             if "action" not in parsed or "target" not in parsed:
                 logger.error(f"Missing required fields in parsed command: {parsed}")

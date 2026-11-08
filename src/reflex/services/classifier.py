@@ -145,7 +145,17 @@ class ReflexClassifier:
             f"Intent validation tier 1 confidence {confidence:.2f} "
             f"< {self.tier1_threshold}, escalating"
         )
-        is_command, confidence = self._validate_intent_single(message, self.tier2_model)
+        # Tier 2 is wrapped TOO. The handler above covers only the first leg,
+        # and a proxy that is down kills both -- so `Raises: LLMError` was
+        # false for exactly the condition that handler exists to survive.
+        # No tier-1 fallback here, unlike classify: this answer decides
+        # whether text is executed as a command, so it fails closed.
+        try:
+            is_command, confidence = self._validate_intent_single(
+                message, self.tier2_model
+            )
+        except httpx.RequestError as e:
+            raise LLMError(f"tier 2 transport failure: {type(e).__name__}") from e
         logger.info(
             f"Intent validation tier 2: is_command={is_command}, confidence={confidence}"
         )
@@ -261,11 +271,28 @@ class ReflexClassifier:
                 f"Classification tier 1 confidence {result.confidence:.2f} "
                 f"< {self.tier1_threshold}, escalating"
             )
-        result = self._classify_single(message, self.tier2_model)
+        # A usable tier-1 answer beats an exception. `result` is set whenever
+        # tier 1 merely scored below tier1_threshold, and handle_capture
+        # stores anything at or above tier2_threshold (0.6, below the 0.7
+        # escalation bar) -- so letting tier 2's failure propagate discarded a
+        # result that would have been filed normally, and the capture was lost
+        # to "Sorry, something went wrong" with nothing retrying.
+        try:
+            tier2 = self._classify_single(message, self.tier2_model)
+        except (LLMError, httpx.RequestError) as e:
+            if result is not None:
+                logger.warning(
+                    f"Tier 2 classification failed: {e}; keeping the tier-1 "
+                    f"answer {result.category} (confidence={result.confidence})"
+                )
+                return result
+            if isinstance(e, LLMError):
+                raise
+            raise LLMError(f"tier 2 transport failure: {type(e).__name__}") from e
         logger.info(
-            f"Classification tier 2: {result.category} (confidence={result.confidence})"
+            f"Classification tier 2: {tier2.category} (confidence={tier2.confidence})"
         )
-        return result
+        return tier2
 
     def _classify_single(self, message: str, model: str) -> ClassificationResult:
         """Classify with a single model.
@@ -319,7 +346,17 @@ class ReflexClassifier:
                 )
             confidence = self._confidence(data, "classification")
 
+            # isinstance, like every field around it. This one reaches a
+            # Postgres %s for a `text` column, and psycopg2 ADAPTS a list to
+            # ARRAY[...] rather than refusing it, so a non-string gets as far
+            # as the server (reflex-cf96).
             reasoning = data.get("reasoning", "")
+            if not isinstance(reasoning, str):
+                logger.warning(
+                    f"model returned reasoning of type "
+                    f"{type(reasoning).__name__}, not a string; dropping it"
+                )
+                reasoning = ""
             # Elements, not just the list: a non-string tag reaches several
             # `', '.join` calls in bot.py and the database. Drop anything that
             # is not a usable string and cap the count.
