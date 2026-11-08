@@ -123,6 +123,18 @@ def generate_title(message: str, max_length: int = 80) -> str:
     return first_line[:max_length - 3] + "..."
 
 
+def _ping_only(user: discord.abc.Snowflake) -> discord.AllowedMentions:
+    """Allow a notification for exactly this user and nothing else.
+
+    The client default is AllowedMentions.none(), which is right for every
+    reply carrying model output but also silences the few replies meant to
+    notify Devon. An ALLOW-LIST of one id restores those without reopening the
+    rest: an @everyone or a stray <@...> in echoed model text still notifies
+    nobody, because it is not this id.
+    """
+    return discord.AllowedMentions(everyone=False, roles=False, users=[user])
+
+
 class ReflexBot(commands.Bot):
     """Discord bot for Reflex."""
 
@@ -150,7 +162,23 @@ class ReflexBot(commands.Bot):
         """Initialize bot."""
         intents = discord.Intents.default()
         intents.message_content = True  # Required to read messages
-        super().__init__(command_prefix="!", intents=intents)
+        # NO MENTIONS BY DEFAULT. execute_move echoes a rejected new_category
+        # back to Discord verbatim -- the rejection path is exactly where an
+        # arbitrary model-supplied value arrives -- and several other replies
+        # interpolate model output. Set on the client so it covers every send,
+        # not only the ones currently known.
+        #
+        # It is a DEFAULT, not a ban: none() also sets users=False, which
+        # silently killed the three replies that deliberately ping Devon.
+        # Those pass a per-send allow-list of one id, which model text cannot
+        # widen. That restores the MENTION ping only -- the merged value keeps
+        # replied_user=False -- so a reply meant to notify must interpolate
+        # the mention and cannot rely on the reply ping.
+        super().__init__(
+            command_prefix="!",
+            intents=intents,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
 
         # Configuration from environment
         self.reflex_channel_id = os.getenv("DISCORD_REFLEX_CHANNEL_ID")
@@ -224,6 +252,10 @@ class ReflexBot(commands.Bot):
         if not tier2_model:
             raise ValueError("REFLEX_LLM_TIER2_MODEL environment variable not set")
 
+        # Optional: required for a proxy, meaningless for a directly
+        # reached ollama endpoint.
+        litellm_api_key = os.getenv("LITELLM_API_KEY")
+
         # Parse thresholds with error handling
         try:
             tier1_threshold = float(
@@ -246,11 +278,23 @@ class ReflexBot(commands.Bot):
             tier2_threshold = 0.6
 
         self.classifier = ReflexClassifier(
-            litellm_url, tier1_model, tier2_model, tier1_threshold, tier2_threshold
+            litellm_url,
+            tier1_model,
+            tier2_model,
+            tier1_threshold,
+            tier2_threshold,
+            api_key=litellm_api_key,
         )
 
-        # Initialize command parser (use Tier 2 model for better accuracy)
-        self.command_parser = CommandParser(litellm_url, tier2_model)
+        # Tier 1 deliberately: tier 2 is a cloud model, and this parses text
+        # the user typed.
+        #
+        # It does NOT make the command path local. validate_intent runs first
+        # and still escalates the same text to tier 2 on low confidence, so
+        # command-shaped text can still leave the estate.
+        self.command_parser = CommandParser(
+            litellm_url, tier1_model, api_key=litellm_api_key
+        )
 
         # Initialize scheduler for digest
         self.scheduler = AsyncIOScheduler(timezone=timezone.utc)
@@ -609,8 +653,17 @@ class ReflexBot(commands.Bot):
             await message.reply("❌ No target category specified in move command.")
             return
 
-        # Validate category
-        if new_category not in self.VALID_CATEGORIES:
+        # isinstance FIRST, even though VALID_CATEGORIES is a list today and
+        # a list membership test on an unhashable value is harmless.
+        # reflex-791e is open to unify this copy with classifier.py's
+        # frozenset, and the moment it does, {"new_category": ["project"]}
+        # raises TypeError into execute_command's broad except -- the exact
+        # bug this commit's sibling fix removed from commands.py,
+        # reintroduced by the cleanup meant to prevent drift.
+        if (
+            not isinstance(new_category, str)
+            or new_category not in self.VALID_CATEGORIES
+        ):
             await message.reply(
                 f"❌ Invalid category: {new_category}. "
                 f"Valid categories: {', '.join(self.VALID_CATEGORIES)}"
@@ -937,7 +990,10 @@ class ReflexBot(commands.Bot):
             self.digest_message_to_entry.pop(message_id, None)
             logger.info(f"Archived entry {entry_id} via digest reaction")
 
-        await reaction.message.reply(f"{user.mention} - ✅ Archived!")
+        await reaction.message.reply(
+            f"{user.mention} - ✅ Archived!",
+            allowed_mentions=_ping_only(user),
+        )
 
     async def handle_snooze_entry(
         self, reaction: discord.Reaction, user: discord.User, entry_id: int, days: int, label: str
@@ -971,7 +1027,8 @@ class ReflexBot(commands.Bot):
         logger.info(f"Snoozed entry {entry_id} for {label} until {snooze_until.date()}")
         await reaction.message.reply(
             f"{user.mention} - Snoozed for {label} "
-            f"(remind on **{snooze_until.strftime('%B %d, %Y')}**)"
+            f"(remind on **{snooze_until.strftime('%B %d, %Y')}**)",
+            allowed_mentions=_ping_only(user),
         )
 
     async def handle_snooze_entry_custom(
@@ -992,7 +1049,8 @@ class ReflexBot(commands.Bot):
             "- `2w` (2 weeks)\n"
             "- `next week`\n"
             "- `next monday`\n"
-            "- `jan 20` or `2026-01-20`"
+            "- `jan 20` or `2026-01-20`",
+            allowed_mentions=_ping_only(user),
         )
 
         # Store pending snooze state (entry_id + digest message ID for cleanup)

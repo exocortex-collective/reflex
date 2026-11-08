@@ -4,6 +4,7 @@ import json
 
 from cortex_utils.llm import LLMClient, LLMError
 from cortex_utils.logging import get_logger
+from cortex_utils.metrics import ERRORS
 
 from reflex.models.entry import ClassificationResult
 
@@ -90,6 +91,7 @@ class ReflexClassifier:
         tier2_model: str,
         tier1_threshold: float = 0.7,
         tier2_threshold: float = 0.6,
+        api_key: str | None = None,
     ):
         """Initialize classifier with LiteLLM client.
 
@@ -99,8 +101,9 @@ class ReflexClassifier:
             tier2_model: Model for tier 2 (e.g., gemini/gemini-1.5-flash)
             tier1_threshold: Confidence threshold for tier 1 (default 0.7)
             tier2_threshold: Confidence threshold for tier 2 (default 0.6)
+            api_key: Bearer token. Optional; see LLMClient.
         """
-        self.llm = LLMClient(litellm_base_url)
+        self.llm = LLMClient(litellm_base_url, api_key)
         self.tier1_model = tier1_model
         self.tier2_model = tier2_model
         self.tier1_threshold = tier1_threshold
@@ -130,15 +133,46 @@ class ReflexClassifier:
                     f"Intent validation tier 1: is_command={is_command}, confidence={confidence}"
                 )
                 return is_command, confidence
-        except LLMError as e:
-            logger.warning(f"Tier 1 intent validation failed: {e}, trying tier 2")
+        # A TIER-1 handler catches Exception, and the breadth is safer here
+        # than anywhere else in this file: all it can do is let tier 2 run.
+        # It cannot invent or keep an answer, because there is none yet.
+        #
+        # It has to be this broad. _post_completion documents four raisable
+        # types and that list is INCOMPLETE: _reject_if_truncated runs inside
+        # its own `except LLMError` block and iterates `choices` without a
+        # type check, so a 200 carrying {"choices": 5} raises a bare
+        # TypeError over the top of the LLMError (utils-f643). A narrow tuple
+        # let that escape and tier 2 was never asked.
+        #
+        # Cost, accepted: a reflex-side fault here -- an AttributeError from a
+        # refactor, say -- is now retried against tier 2 instead of failing
+        # locally. That sends the user's text to the CLOUD model on a path
+        # that previously would not have (see reflex-3379 for the standing
+        # version of that trade), and if tier 2 then succeeds the fault is
+        # invisible apart from this line. exc_info so it is diagnosable.
+        except Exception as e:
+            logger.warning(
+                f"Tier 1 intent validation failed: {e}, trying tier 2",
+                exc_info=True,
+            )
 
         # Escalate to Tier 2
         logger.info(
             f"Intent validation tier 1 confidence {confidence:.2f} "
             f"< {self.tier1_threshold}, escalating"
         )
-        is_command, confidence = self._validate_intent_single(message, self.tier2_model)
+        # A proxy that is down kills BOTH legs, so the handler above is not
+        # enough on its own. No tier-1 fallback here, unlike classify: this
+        # answer decides whether text is executed as a command, so it fails
+        # closed.
+        try:
+            is_command, confidence = self._validate_intent_single(
+                message, self.tier2_model
+            )
+        except LLMError:
+            raise
+        except Exception as e:
+            raise LLMError(f"tier 2 intent validation failed: {type(e).__name__}") from e
         logger.info(
             f"Intent validation tier 2: is_command={is_command}, confidence={confidence}"
         )
@@ -150,10 +184,12 @@ class ReflexClassifier:
 
         `null`, `5`, `[]` and `"x"` are all valid JSON. Only an object has the
         fields the guards below read, and reaching them with anything else
-        raises AttributeError (`data.get`) or TypeError (`"x" not in data`) --
-        neither of which is an LLMError, so classify()'s tier-1 handler does
-        not catch it, the cascade never reaches tier 2, and a raw exception
-        leaves the classifier.
+        raises AttributeError (`data.get`) or TypeError (`"x" not in data`).
+
+        Raising LLMError instead is what keeps the DIAGNOSIS: the cascade
+        catches Exception either way, but the tier-2 legs re-raise an LLMError
+        unchanged, so this message reaches the caller intact where a bare
+        TypeError is flattened to "tier 2 classification failed: TypeError".
         """
         if not isinstance(data, dict):
             raise LLMError(f"{where} returned JSON {type(data).__name__}, not an object")
@@ -243,8 +279,13 @@ class ReflexClassifier:
                     f"Classification tier 1: {result.category} (confidence={result.confidence})"
                 )
                 return result
-        except LLMError as e:
-            logger.warning(f"Tier 1 classification failed: {e}, trying tier 2")
+        # Exception, for the reason given on validate_intent's tier-1 handler,
+        # including the same accepted cost: a miss here means tier 2 is never
+        # asked at all, and a reflex-side fault now reaches the cloud model.
+        except Exception as e:
+            logger.warning(
+                f"Tier 1 classification failed: {e}, trying tier 2", exc_info=True
+            )
             # Continue to tier 2
 
         # Escalate to Tier 2
@@ -253,11 +294,45 @@ class ReflexClassifier:
                 f"Classification tier 1 confidence {result.confidence:.2f} "
                 f"< {self.tier1_threshold}, escalating"
             )
-        result = self._classify_single(message, self.tier2_model)
+        # A STORABLE tier-1 answer beats an exception. handle_capture files
+        # anything at or above tier2_threshold, which is below the escalation
+        # bar, so a band of answers escalate and would still have been filed
+        # -- and letting tier 2's failure propagate threw those away.
+        #
+        # This handler governs all three outcomes below, not just the keep:
+        # a non-LLMError that reaches the end of it is wrapped AS an LLMError,
+        # so the breadth also changes what the caller sees when nothing is
+        # kept. See the tier-1 handlers for why it has to be this broad.
+        try:
+            tier2 = self._classify_single(message, self.tier2_model)
+        except Exception as e:
+            if result is not None and result.confidence >= self.tier2_threshold:
+                # Counted, because this is the one outcome that is otherwise
+                # SILENT: the capture succeeds on the tier-1 answer, so
+                # nothing else in the estate records that tier 2 is down and
+                # an expired key looks like a model that merely agrees. The
+                # paths below raise, and on_message counts those already --
+                # incrementing here too would double-count one failure.
+                ERRORS.labels(service="reflex", error_type="classify_tier2").inc()
+                logger.warning(
+                    f"Tier 2 classification failed: {e}; keeping the storable "
+                    f"tier-1 answer {result.category} "
+                    f"(confidence={result.confidence})"
+                )
+                return result
+            # Below tier2_threshold there is nothing worth keeping, so the
+            # caller must hear about it rather than be handed an answer
+            # handle_capture would refuse anyway.
+            if isinstance(e, LLMError):
+                # Re-raised unchanged: the model's own diagnosis ("category
+                # 'nope' is not one of ...") is more useful than a wrapper
+                # saying the transport failed, which it did not.
+                raise
+            raise LLMError(f"tier 2 classification failed: {type(e).__name__}") from e
         logger.info(
-            f"Classification tier 2: {result.category} (confidence={result.confidence})"
+            f"Classification tier 2: {tier2.category} (confidence={tier2.confidence})"
         )
-        return result
+        return tier2
 
     def _classify_single(self, message: str, model: str) -> ClassificationResult:
         """Classify with a single model.
@@ -302,8 +377,9 @@ class ReflexClassifier:
                 # reformatted, never mapped to a different member.
                 category = category.strip().strip("*_`").strip().lower()
             # isinstance first: `["admin"] not in VALID_CATEGORIES` raises
-            # TypeError (unhashable), which no handler here catches, so the
-            # cascade is skipped and the operator sees a raw TypeError.
+            # TypeError (unhashable), and a TypeError out of here is flattened
+            # to "tier 2 classification failed: TypeError" by the tier-2
+            # handler above, losing which value the model actually sent.
             if not isinstance(category, str) or category not in VALID_CATEGORIES:
                 raise LLMError(
                     f"model returned category {category!r}, which is not one of "
@@ -311,7 +387,16 @@ class ReflexClassifier:
                 )
             confidence = self._confidence(data, "classification")
 
+            # Reaches a Postgres %s for a `text` column, and psycopg2
+            # ADAPTS a list to ARRAY[...] rather than refusing it, so an
+            # unchecked non-string gets as far as the server (reflex-cf96).
             reasoning = data.get("reasoning", "")
+            if not isinstance(reasoning, str):
+                logger.warning(
+                    f"model returned reasoning of type "
+                    f"{type(reasoning).__name__}, not a string; dropping it"
+                )
+                reasoning = ""
             # Elements, not just the list: a non-string tag reaches several
             # `', '.join` calls in bot.py and the database. Drop anything that
             # is not a usable string and cap the count.
