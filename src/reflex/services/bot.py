@@ -1383,7 +1383,6 @@ def main() -> None:
         # `async with` has already closed the bot, so this is an orderly stop
         # and not a failure: exit 0, no traceback.
         pass
-    # Logged here rather than in the handler, where it is not signal-safe.
     logger.info("Reflex bot stopped")
 
 
