@@ -58,6 +58,8 @@ def _child(
 ) -> tuple[int, str]:
     """Run main() in a subprocess, SIGTERM it, return (exit code, stdout).
 
+    `install=False` stubs out signal.signal in the child, so main() installs no
+    handler and the default disposition applies -- the control branch.
     `signals` > 1 sends the extra SIGTERMs while __aexit__ is still running,
     which is what `aexit_sleep` buys time for.
     """
