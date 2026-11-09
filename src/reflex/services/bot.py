@@ -4,6 +4,7 @@ import asyncio
 import hmac
 import os
 import re
+import signal
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Protocol
@@ -1331,6 +1332,20 @@ async def start_webhook_server(bot: ReflexBot, port: int) -> web.AppRunner:
     return runner
 
 
+def _shutdown_on_sigterm(signum: int, frame: object) -> None:
+    """Turn SIGTERM into a KeyboardInterrupt, which main() exits cleanly on.
+
+    Needed because this process is PID 1 in its container, where the kernel
+    drops a signal that has no handler. Measurements in reflex-6b36.
+    """
+    # A repeat SIGTERM would raise inside asyncio's cleanup and abort it.
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    # Nothing is logged here: a log call interrupted mid-write to stderr
+    # raises RuntimeError("reentrant call") instead, and then the raise below
+    # never runs.
+    raise KeyboardInterrupt
+
+
 def main() -> None:
     """Main entry point."""
     # Start metrics server
@@ -1358,7 +1373,18 @@ def main() -> None:
             # Start bot
             await bot.start(bot_token)
 
-    asyncio.run(run_bot())
+    # Installed before the loop starts so a stop arriving during startup is
+    # not lost. reflex-6b36.
+    signal.signal(signal.SIGTERM, _shutdown_on_sigterm)
+    try:
+        asyncio.run(run_bot())
+    except KeyboardInterrupt:
+        # Raised by the handler above, or by Ctrl-C. Either way run_bot's
+        # `async with` has already closed the bot, so this is an orderly stop
+        # and not a failure: exit 0, no traceback.
+        pass
+    # Logged here rather than in the handler, where it is not signal-safe.
+    logger.info("Reflex bot stopped")
 
 
 if __name__ == "__main__":
